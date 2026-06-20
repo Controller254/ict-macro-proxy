@@ -71,3 +71,4 @@ function decodeEntities(str) {
 function jsonResponse(obj, status) {
   return new Response(JSON.stringify(obj), { status, headers: { ...CORS_HEADERS, "Content-Type": "application/json" } });
 }
+// trigger build
