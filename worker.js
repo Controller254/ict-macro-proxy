@@ -55,14 +55,27 @@ async function fetchFxssiRaw() {
   const html = await res.text();
   const hasPercent = html.indexOf("%") !== -1;
   const hasEURUSD = html.indexOf("EURUSD") !== -1;
-  const snippet = html.length > 3000 ? html.slice(0, 3000) : html;
+
+  // Jump straight to the first occurrence of EURUSD in the page and show
+  // the 3000 characters AROUND it, instead of the page <head> metadata.
+  const eurusdIdx = html.indexOf("EURUSD");
+  let snippet;
+  if (eurusdIdx !== -1) {
+    const start = Math.max(0, eurusdIdx - 500);
+    const end = Math.min(html.length, eurusdIdx + 2500);
+    snippet = html.slice(start, end);
+  } else {
+    snippet = html.length > 3000 ? html.slice(0, 3000) : html;
+  }
+
   return jsonResponse(
     {
       status: res.status,
       htmlLength: html.length,
       containsPercentSign: hasPercent,
       containsEURUSD: hasEURUSD,
-      first3000Chars: snippet,
+      eurusdFirstIndex: eurusdIdx,
+      snippetAroundEURUSD: snippet,
     },
     200
   );
