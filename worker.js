@@ -13,7 +13,23 @@ const NEWS_SOURCES = [
 let calendarCache = { data: null, fetchedAt: 0 };
 const CALENDAR_CACHE_MS = 5 * 60 * 1000;
 
-let cotCache = { data: null, fetchedAt: 0 };
+// NOTE: COT caching now lives in Workers KV (env.COT_KV), NOT a module-level
+// variable. Cloudflare Workers are stateless across invocations — a plain
+// JS variable like `let cotCache = {...}` only survives within a single
+// isolate, and Cloudflare may route different requests to different
+// isolates (or evict/recreate an isolate) at any time with no warning.
+// That meant our in-memory cache was silently useless for most requests:
+// the "TEST WORKER CONNECTION" button could hit a fresh isolate that
+// happened to reach CFTC successfully, while the next real request from
+// the terminal hit a DIFFERENT isolate with an empty cache, retried CFTC
+// fresh, hit CFTC's intermittent WAF rejection again, and surfaced a 502
+// to the user — even though "the worker is definitely fetching CFTC fine"
+// from the dashboard's point of view a moment earlier.
+// Workers KV is real durable storage shared across all isolates, so once
+// ANY request succeeds, every other invocation — anywhere — sees the
+// cached data immediately. This is the actual fix for the 502s, not just
+// the retry/backoff logic below (which still helps for cold-cache misses).
+const COT_CACHE_KEY = "cot_latest";
 const COT_CACHE_MS = 60 * 60 * 1000; // COT updates once a week (Fri), 1hr cache is plenty
 
 // CFTC's Traders in Financial Futures (TFF) dataset, Socrata Open Data API.
@@ -55,7 +71,7 @@ export default {
         return await proxyNews();
       }
       if (url.pathname === "/cot") {
-        return await proxyCot();
+        return await proxyCot(env);
       }
       if (url.pathname === "/fxssi-raw") {
         return await fetchFxssiRaw();
@@ -71,10 +87,15 @@ export default {
 };
 
 // ── COT (Commitment of Traders) ──────────────────────────────────────────
-async function proxyCot() {
+async function proxyCot(env) {
   const now = Date.now();
-  if (cotCache.data && now - cotCache.fetchedAt < COT_CACHE_MS) {
-    return jsonResponse(cotCache.data, 200, { "X-Cache": "HIT" });
+
+  // 1. Check KV first — this is durable and shared across ALL isolates,
+  //    unlike a module-level variable. If a fresh-enough copy exists here,
+  //    serve it immediately with zero CFTC calls.
+  const cached = await readCotCache(env);
+  if (cached && now - cached.fetchedAt < COT_CACHE_MS) {
+    return jsonResponse(cached.data, 200, { "X-Cache": "HIT" });
   }
 
   // Pull the most recent report for every market in one call, sorted by
@@ -126,8 +147,12 @@ async function proxyCot() {
   }
 
   if (!res || !res.ok) {
-    if (cotCache.data) {
-      return jsonResponse(cotCache.data, 200, { "X-Cache": "STALE-ON-ERROR" });
+    // 2. CFTC failed this round — fall back to ANY cached copy we have in
+    //    KV, even if it's older than the normal 1hr freshness window.
+    //    Stale COT data (positioning from last Friday) is still far more
+    //    useful than an error, since COT only updates weekly anyway.
+    if (cached && cached.data) {
+      return jsonResponse(cached.data, 200, { "X-Cache": "STALE-ON-ERROR" });
     }
     // Surface the REAL upstream status (or network error) instead of
     // always reporting a generic 502 — this is the difference between
@@ -143,15 +168,15 @@ async function proxyCot() {
   try {
     rows = await res.json();
   } catch (e) {
-    if (cotCache.data) {
-      return jsonResponse(cotCache.data, 200, { "X-Cache": "STALE-PARSE-ERROR" });
+    if (cached && cached.data) {
+      return jsonResponse(cached.data, 200, { "X-Cache": "STALE-PARSE-ERROR" });
     }
     return jsonResponse({ error: { message: "CFTC source returned unparseable data: " + e.message } }, 502);
   }
 
   if (!Array.isArray(rows)) {
-    if (cotCache.data) {
-      return jsonResponse(cotCache.data, 200, { "X-Cache": "STALE-SHAPE-ERROR" });
+    if (cached && cached.data) {
+      return jsonResponse(cached.data, 200, { "X-Cache": "STALE-SHAPE-ERROR" });
     }
     return jsonResponse({ error: { message: "CFTC source returned unexpected shape." } }, 502);
   }
@@ -166,8 +191,8 @@ async function proxyCot() {
     const ageMs = now - new Date(newestDate).getTime();
     const ageDays = ageMs / (24 * 60 * 60 * 1000);
     if (ageDays > 10 || ageDays < -1) {
-      if (cotCache.data) {
-        return jsonResponse(cotCache.data, 200, { "X-Cache": "STALE-SUSPICIOUS-DATE" });
+      if (cached && cached.data) {
+        return jsonResponse(cached.data, 200, { "X-Cache": "STALE-SUSPICIOUS-DATE" });
       }
       return jsonResponse(
         {
@@ -200,8 +225,40 @@ async function proxyCot() {
     source: "https://publicreporting.cftc.gov/Commitments-of-Traders/TFF-Futures-Only/gpe5-46if (CFTC public API)",
   };
 
-  cotCache = { data: payload, fetchedAt: now };
+  // 3. Persist to KV so every other isolate / future request benefits,
+  //    not just this one. Don't let a KV write failure break the response
+  //    we already have — log and continue.
+  await writeCotCache(env, { data: payload, fetchedAt: now });
+
   return jsonResponse(payload, 200, { "X-Cache": "MISS" });
+}
+
+// KV read/write helpers — tolerate a missing binding (e.g. local dev
+// without KV configured) by behaving as if there's simply no cache yet,
+// rather than throwing and taking down the whole /cot endpoint.
+async function readCotCache(env) {
+  if (!env || !env.COT_KV) return null;
+  try {
+    const raw = await env.COT_KV.get(COT_CACHE_KEY);
+    if (!raw) return null;
+    return JSON.parse(raw);
+  } catch (e) {
+    return null;
+  }
+}
+
+async function writeCotCache(env, entry) {
+  if (!env || !env.COT_KV) return;
+  try {
+    // expirationTtl is a belt-and-suspenders cleanup; our own freshness
+    // check above (COT_CACHE_MS) is what actually governs HIT vs MISS.
+    await env.COT_KV.put(COT_CACHE_KEY, JSON.stringify(entry), {
+      expirationTtl: 7 * 24 * 60 * 60, // 7 days
+    });
+  } catch (e) {
+    // Swallow — a failed cache write shouldn't fail the request that
+    // already has good data to return to the caller.
+  }
 }
 
 function sleep(ms) {
