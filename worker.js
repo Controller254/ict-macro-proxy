@@ -13,9 +13,6 @@ const NEWS_SOURCES = [
 let calendarCache = { data: null, fetchedAt: 0 };
 const CALENDAR_CACHE_MS = 5 * 60 * 1000;
 
-let myfxbookSession = { id: null, fetchedAt: 0 };
-const MYFXBOOK_SESSION_TTL_MS = 50 * 60 * 1000;
-
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -29,11 +26,14 @@ export default {
       if (url.pathname === "/news") {
         return await proxyNews();
       }
+      if (url.pathname === "/fxssi-raw") {
+        return await fetchFxssiRaw();
+      }
       if (url.pathname === "/sentiment") {
-        return await proxySentiment(env);
+        return await proxySentimentFxssi();
       }
       return jsonResponse(
-        { error: { message: "Unknown endpoint. Use /calendar, /news, or /sentiment." } },
+        { error: { message: "Unknown endpoint. Use /calendar, /news, /sentiment, or /fxssi-raw." } },
         404
       );
     } catch (err) {
@@ -41,6 +41,74 @@ export default {
     }
   },
 };
+
+// Returns the raw HTML FXSSI sends back, so we can inspect with our own
+// eyes whether the percentages exist in the server response or only
+// appear after client-side JavaScript runs in a real browser.
+async function fetchFxssiRaw() {
+  const res = await fetch("https://fxssi.com/tools/current-ratio", {
+    headers: {
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+      Accept: "text/html,application/xhtml+xml",
+    },
+  });
+  const html = await res.text();
+  const hasPercent = html.indexOf("%") !== -1;
+  const hasEURUSD = html.indexOf("EURUSD") !== -1;
+  const snippet = html.length > 3000 ? html.slice(0, 3000) : html;
+  return jsonResponse(
+    {
+      status: res.status,
+      htmlLength: html.length,
+      containsPercentSign: hasPercent,
+      containsEURUSD: hasEURUSD,
+      first3000Chars: snippet,
+    },
+    200
+  );
+}
+
+async function proxySentimentFxssi() {
+  const res = await fetch("https://fxssi.com/tools/current-ratio", {
+    headers: {
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+      Accept: "text/html",
+    },
+  });
+  if (!res.ok) {
+    return jsonResponse({ error: { message: "FXSSI returned " + res.status } }, 502);
+  }
+  const html = await res.text();
+  const pairs = parseFxssiSentiment(html);
+  if (Object.keys(pairs).length === 0) {
+    return jsonResponse(
+      {
+        error: {
+          message: "Could not find sentiment percentages in FXSSI's server response. The data may load via client-side JavaScript only.",
+        },
+      },
+      502
+    );
+  }
+  return jsonResponse({ pairs: pairs, source: "https://fxssi.com/tools/current-ratio" }, 200);
+}
+
+function parseFxssiSentiment(html) {
+  const result = {};
+  const pattern = /([A-Z]{6})[^0-9%]{0,300}?(\d{1,3})\s*%[^0-9%]{0,60}?(\d{1,3})\s*%/g;
+  let match;
+  const seen = {};
+  while ((match = pattern.exec(html)) !== null) {
+    const symbol = match[1];
+    const buy = parseInt(match[2], 10);
+    const sell = parseInt(match[3], 10);
+    if (seen[symbol]) continue;
+    if (buy + sell !== 100) continue;
+    seen[symbol] = true;
+    result[symbol] = { buyPct: buy, sellPct: sell };
+  }
+  return result;
+}
 
 async function proxyCalendar() {
   const now = Date.now();
@@ -65,10 +133,7 @@ async function proxyCalendar() {
     if (calendarCache.data) {
       return jsonResponse(calendarCache.data, 200, { "X-Cache": "STALE-RATE-LIMITED" });
     }
-    return jsonResponse(
-      { error: { message: "Calendar source rate-limited this Worker. Try again shortly." } },
-      429
-    );
+    return jsonResponse({ error: { message: "Calendar source rate-limited this Worker. Try again shortly." } }, 429);
   }
   let data;
   try {
@@ -153,70 +218,6 @@ function decodeEntities(s) {
     .replace(/&quot;/g, '"')
     .replace(/&#39;/g, "'")
     .replace(/&apos;/g, "'");
-}
-
-async function getMyfxbookSession(env) {
-  const now = Date.now();
-  if (myfxbookSession.id && now - myfxbookSession.fetchedAt < MYFXBOOK_SESSION_TTL_MS) {
-    return myfxbookSession.id;
-  }
-  const email = env.MYFXBOOK_EMAIL;
-  const password = env.MYFXBOOK_PASSWORD;
-  const emailLen = email ? email.length : 0;
-  const passLen = password ? password.length : 0;
-  console.log("DEBUG email=" + JSON.stringify(email) + " emailLen=" + emailLen + " passLen=" + passLen);
-  if (!email || !password) {
-    return null;
-  }
-  const loginUrl = "https://www.myfxbook.com/api/login.json?email=" + encodeURIComponent(email) + "&password=" + encodeURIComponent(password);
-  const res = await fetch(loginUrl);
-  if (!res.ok) {
-    throw new Error("Myfxbook login HTTP " + res.status);
-  }
-  const data = await res.json();
-  if (data.error || !data.session) {
-    throw new Error("Myfxbook login failed: " + (data.message || "no session returned"));
-  }
-  myfxbookSession = { id: data.session, fetchedAt: now };
-  return data.session;
-}
-
-async function proxySentiment(env) {
-  let session;
-  try {
-    session = await getMyfxbookSession(env);
-  } catch (err) {
-    return jsonResponse({ error: { message: "Myfxbook authentication failed: " + err.message } }, 502);
-  }
-  if (!session) {
-    return jsonResponse(
-      { error: { message: "Sentiment not configured. Set MYFXBOOK_EMAIL and MYFXBOOK_PASSWORD as Worker secrets." } },
-      501
-    );
-  }
-  const outlookUrl = "https://www.myfxbook.com/api/get-community-outlook.json?session=" + encodeURIComponent(session);
-  const res = await fetch(outlookUrl);
-  if (!res.ok) {
-    return jsonResponse({ error: { message: "Myfxbook outlook returned " + res.status } }, 502);
-  }
-  const data = await res.json();
-  if (data.error) {
-    myfxbookSession = { id: null, fetchedAt: 0 };
-    return jsonResponse({ error: { message: "Myfxbook outlook error: " + (data.message || "unknown") } }, 502);
-  }
-  const symbols = Array.isArray(data.symbols) ? data.symbols : [];
-  const pairs = {};
-  for (let i = 0; i < symbols.length; i++) {
-    const s = symbols[i];
-    if (!s.name) continue;
-    pairs[s.name] = {
-      longPercentage: s.longPercentage,
-      shortPercentage: s.shortPercentage,
-      longVolume: s.longVolume,
-      shortVolume: s.shortVolume,
-    };
-  }
-  return jsonResponse({ pairs: pairs, source: "https://www.myfxbook.com/community/outlook" }, 200);
 }
 
 function jsonResponse(body, status, extraHeaders) {
