@@ -152,18 +152,6 @@ async function proxyCot(env) {
   const orderClause = encodeURIComponent("report_date_as_yyyy_mm_dd DESC");
   const queryUrl = CFTC_TFF_URL + "?$limit=2000&$order=" + orderClause;
 
-  // BUG FIX: publicreporting.cftc.gov intermittently returns 502/503 to
-  // requests coming from Cloudflare Workers' shared IP ranges (this is a
-  // known pattern — government WAFs and bot-detection on .gov sites often
-  // reject traffic from cloud-provider IP blocks even though the request
-  // itself is fine). A single failed attempt was being treated as a hard
-  // failure with no retry, even though a second attempt moments later
-  // frequently succeeds. We now retry transient-looking failures (502,
-  // 503, 504, and network-level fetch throws) up to 3 times with a short
-  // backoff before giving up. We also use a realistic full browser User-
-  // Agent string instead of a generic "compatible; ICT-Terminal-Worker/1.0"
-  // identifier, since some .gov WAFs specifically allowlist real browser
-  // UAs and challenge or reject anything that self-identifies as a bot.
   const REALISTIC_UA =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
   const TRANSIENT_STATUSES = [429, 502, 503, 504];
@@ -182,133 +170,74 @@ async function proxyCot(env) {
         },
       });
       lastStatus = res.status;
-      if (res.ok) break; // success, stop retrying
-      if (TRANSIENT_STATUSES.indexOf(res.status) === -1) break; // non-transient, no point retrying
+      if (res.ok) break;
+      if (TRANSIENT_STATUSES.indexOf(res.status) === -1) break;
     } catch (err) {
       lastError = err;
       res = null;
     }
     if (attempt < MAX_ATTEMPTS) {
-      // Short backoff: 400ms, then 900ms. Workers have a CPU-time budget,
-      // so we keep this brief rather than a long exponential wait.
       await sleep(attempt === 1 ? 400 : 900);
     }
   }
 
   if (!res || !res.ok) {
-    // 2. CFTC failed this round — fall back to ANY cached copy we have in
-    //    KV, even if it's older than the normal 1hr freshness window.
-    //    Stale COT data (positioning from last Friday) is still far more
-    //    useful than an error, since COT only updates weekly anyway.
-    if (cached && cached.data) {
+    if (cached) {
       return jsonResponse(cached.data, 200, { "X-Cache": "STALE-ON-ERROR" });
     }
-    // Surface the REAL upstream status (or network error) instead of
-    // always reporting a generic 502 — this is the difference between
-    // "CFTC rejected us with 403" and "CFTC's server actually errored",
-    // which previously looked identical from the terminal's point of view.
-    const detail = lastError
-      ? "network error contacting CFTC: " + lastError.message
-      : "CFTC source returned HTTP " + lastStatus + " after " + MAX_ATTEMPTS + " attempts";
-    return jsonResponse({ error: { message: detail } }, lastStatus && lastStatus < 500 ? lastStatus : 502);
+    return jsonResponse(
+      {
+        error: {
+          message:
+            "CFTC fetch failed after " + MAX_ATTEMPTS + " attempts. Last status: " +
+            (lastStatus || "network error") + (lastError ? " (" + lastError.message + ")" : ""),
+        },
+      },
+      502
+    );
   }
 
   let rows;
   try {
     rows = await res.json();
   } catch (e) {
-    if (cached && cached.data) {
-      return jsonResponse(cached.data, 200, { "X-Cache": "STALE-PARSE-ERROR" });
-    }
-    return jsonResponse({ error: { message: "CFTC source returned unparseable data: " + e.message } }, 502);
+    if (cached) return jsonResponse(cached.data, 200, { "X-Cache": "STALE-PARSE-ERROR" });
+    return jsonResponse({ error: { message: "CFTC returned unparseable JSON: " + e.message } }, 502);
   }
 
-  if (!Array.isArray(rows)) {
-    if (cached && cached.data) {
-      return jsonResponse(cached.data, 200, { "X-Cache": "STALE-SHAPE-ERROR" });
-    }
-    return jsonResponse({ error: { message: "CFTC source returned unexpected shape." } }, 502);
-  }
-
-  // Sanity check: confirm rows are actually sorted newest-first. CFTC
-  // publishes Fridays for the prior Tuesday's positions, so under normal
-  // conditions the newest row is 3-4 days old. But report weeks can stack
-  // (e.g. right after a holiday delay) and 12+ day gaps between when we
-  // check and when the next Friday release lands are normal, not a bug.
-  // 16 days gives headroom for a single missed/delayed release before this
-  // flags something as genuinely wrong upstream.
-  const newestDate = rows.length > 0 ? rows[0].report_date_as_yyyy_mm_dd : null;
-  if (newestDate) {
-    const ageMs = now - new Date(newestDate).getTime();
-    const ageDays = ageMs / (24 * 60 * 60 * 1000);
-    if (ageDays > 16 || ageDays < -1) {
-      if (cached && cached.data) {
-        return jsonResponse(cached.data, 200, { "X-Cache": "STALE-SUSPICIOUS-DATE" });
-      }
-      return jsonResponse(
-        {
-          error: {
-            message:
-              "CFTC data ordering looks wrong (newest row dated " +
-              newestDate +
-              ", " +
-              Math.round(ageDays) +
-              " days old). Expected a report from within the last week.",
-          },
-        },
-        502
-      );
+  const markets = {};
+  let asOf = null;
+  for (const ourSym in COT_SYMBOL_MAP) {
+    const needle = COT_SYMBOL_MAP[ourSym];
+    const row = findFirstMatchingRow(rows, needle);
+    if (row) {
+      markets[ourSym] = summarizeCotRow(row);
+      if (!asOf || row.report_date_as_yyyy_mm_dd > asOf) asOf = row.report_date_as_yyyy_mm_dd;
     }
   }
 
-  const result = {};
-  for (const ourSymbol in COT_SYMBOL_MAP) {
-    const needle = COT_SYMBOL_MAP[ourSymbol];
-    const match = findFirstMatchingRow(rows, needle);
-    if (match) {
-      result[ourSymbol] = summarizeCotRow(match);
-    }
-  }
-
-  const payload = {
-    asOf: newestDate,
-    markets: result,
-    source: "https://publicreporting.cftc.gov/Commitments-of-Traders/TFF-Futures-Only/gpe5-46if (CFTC public API)",
-  };
-
-  // 3. Persist to KV so every other isolate / future request benefits,
-  //    not just this one. Don't let a KV write failure break the response
-  //    we already have — log and continue.
-  await writeCotCache(env, { data: payload, fetchedAt: now });
-
+  const payload = { markets, asOf, fetchedAt: now };
+  await writeCotCache(env, payload, now);
   return jsonResponse(payload, 200, { "X-Cache": "MISS" });
 }
 
-// KV read/write helpers — tolerate a missing binding (e.g. local dev
-// without KV configured) by behaving as if there's simply no cache yet,
-// rather than throwing and taking down the whole /cot endpoint.
 async function readCotCache(env) {
-  if (!env || !env.COT_KV) return null;
   try {
+    if (!env.COT_KV) return null;
     const raw = await env.COT_KV.get(COT_CACHE_KEY);
     if (!raw) return null;
-    return JSON.parse(raw);
+    const parsed = JSON.parse(raw);
+    return { data: parsed, fetchedAt: parsed.fetchedAt || 0 };
   } catch (e) {
     return null;
   }
 }
-
-async function writeCotCache(env, entry) {
-  if (!env || !env.COT_KV) return;
+async function writeCotCache(env, payload, now) {
   try {
-    // expirationTtl is a belt-and-suspenders cleanup; our own freshness
-    // check above (COT_CACHE_MS) is what actually governs HIT vs MISS.
-    await env.COT_KV.put(COT_CACHE_KEY, JSON.stringify(entry), {
-      expirationTtl: 7 * 24 * 60 * 60, // 7 days
-    });
+    if (!env.COT_KV) return;
+    await env.COT_KV.put(COT_CACHE_KEY, JSON.stringify(payload));
   } catch (e) {
-    // Swallow — a failed cache write shouldn't fail the request that
-    // already has good data to return to the caller.
+    // non-fatal — cache write failure shouldn't break the response
   }
 }
 
@@ -329,14 +258,9 @@ function findFirstMatchingRow(rows, needle) {
   const newestDate = rows.length > 0 ? rows[0].report_date_as_yyyy_mm_dd : null;
   for (let i = 0; i < rows.length; i++) {
     const name = (rows[i].market_and_exchange_names || "").toUpperCase();
-    // Skip cross-rate contracts (e.g. "EURO FX/JAPANESE YEN XRATE") so a
-    // plain currency name like "JAPANESE YEN" only matches the real
-    // standalone Japanese Yen futures, not every cross-rate pair that
-    // happens to mention yen.
     if (name.indexOf("/") !== -1 || name.indexOf("XRATE") !== -1) continue;
     if (name.indexOf(upperNeedle) !== -1) {
       if (!firstMatch) firstMatch = rows[i];
-      // Prefer an exact newest-date match if we find one
       if (newestDate && rows[i].report_date_as_yyyy_mm_dd === newestDate) {
         return rows[i];
       }
@@ -347,14 +271,6 @@ function findFirstMatchingRow(rows, needle) {
 
 function summarizeCotRow(row) {
   const num = (v) => (v === undefined || v === null || v === "" ? 0 : parseInt(v, 10));
-
-  // IMPORTANT: CFTC's actual field names are inconsistent across trader
-  // categories — dealer_positions_long_all/short_all DO have an "_all"
-  // suffix, but asset_mgr_positions_long/short and lev_money_positions_
-  // long/short do NOT. Reading the wrong (nonexistent) field name silently
-  // returned undefined -> 0 for every market, which is why Asset Manager
-  // and Leveraged Funds always showed flat/zero before. Confirmed directly
-  // against CFTC's own x-soda2-fields header via /cot-debug.
   const assetMgrLong = num(row.asset_mgr_positions_long);
   const assetMgrShort = num(row.asset_mgr_positions_short);
   const levMoneyLong = num(row.lev_money_positions_long);
@@ -484,7 +400,11 @@ function decodeEntities(s) {
     .replace(/&apos;/g, "'");
 }
 
-// ── FXSSI DEBUG (kept for now, harmless) ───────────────────────────────────
+// ── FXSSI DEBUG — now returns actual HTML snippets, not just length,
+// so the real DOM structure can be inspected before writing a parser.
+// Returns several different slices since the sentiment data is likely
+// inside a <script> JSON blob or data-* attributes rather than plain
+// visible text — searching blind for "% buy" text would be guessing.
 async function fetchFxssiRaw() {
   const res = await fetch("https://fxssi.com/tools/current-ratio", {
     headers: {
@@ -493,7 +413,31 @@ async function fetchFxssiRaw() {
     },
   });
   const html = await res.text();
-  return jsonResponse({ status: res.status, htmlLength: html.length }, 200);
+
+  // Look for common patterns: JSON embedded in script tags, data attributes
+  // with percentages, or class names hinting at sentiment/ratio widgets.
+  const scriptBlocks = (html.match(/<script[^>]*>[\s\S]*?<\/script>/gi) || [])
+    .filter(function(s){ return /sentiment|ratio|percent|long|short/i.test(s); })
+    .slice(0, 3)
+    .map(function(s){ return s.slice(0, 2000); });
+
+  const percentMatches = (html.match(/[\s"'>]\d{1,3}(\.\d+)?\s?%/g) || []).slice(0, 30);
+
+  const dataAttrMatches = (html.match(/data-[a-z-]*(ratio|sentiment|long|short|percent)[a-z-]*="[^"]*"/gi) || []).slice(0, 20);
+
+  // Try to find a section mentioning a known instrument like EURUSD/GBPUSD
+  // near a percentage, to locate the actual repeating row structure.
+  const eurIdx = html.search(/EUR\s*\/?\s*USD/i);
+  const eurContext = eurIdx > -1 ? html.slice(Math.max(0, eurIdx - 300), eurIdx + 700) : null;
+
+  return jsonResponse({
+    status: res.status,
+    htmlLength: html.length,
+    scriptBlocksMatchingKeywords: scriptBlocks,
+    percentMatches: percentMatches,
+    dataAttrMatches: dataAttrMatches,
+    eurUsdContext: eurContext,
+  }, 200);
 }
 
 // ── HELPERS ──────────────────────────────────────────────────────────────
