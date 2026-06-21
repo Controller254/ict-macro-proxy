@@ -73,11 +73,14 @@ export default {
       if (url.pathname === "/cot") {
         return await proxyCot(env);
       }
+      if (url.pathname === "/cot-debug") {
+        return await debugCot();
+      }
       if (url.pathname === "/fxssi-raw") {
         return await fetchFxssiRaw();
       }
       return jsonResponse(
-        { error: { message: "Unknown endpoint. Use /calendar, /news, /cot, or /fxssi-raw." } },
+        { error: { message: "Unknown endpoint. Use /calendar, /news, /cot, /cot-debug, or /fxssi-raw." } },
         404
       );
     } catch (err) {
@@ -85,6 +88,45 @@ export default {
     }
   },
 };
+
+// ── TEMPORARY DIAGNOSTIC — surfaces the EXACT raw response CFTC gives this
+// Worker right now: status, key headers, and the first chunk of body text.
+// This exists purely to identify why /cot is returning 502 — once we know
+// the real cause (WAF block page, rate-limit message, different error,
+// etc.) this endpoint can be deleted. Visit /cot-debug directly in a
+// browser tab to see the output.
+async function debugCot() {
+  const REALISTIC_UA =
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
+  const orderClause = encodeURIComponent("report_date_as_yyyy_mm_dd DESC");
+  const queryUrl = CFTC_TFF_URL + "?$limit=5&$order=" + orderClause;
+  try {
+    const res = await fetch(queryUrl, {
+      headers: { "User-Agent": REALISTIC_UA, Accept: "application/json" },
+    });
+    const text = await res.text();
+    const headersObj = {};
+    res.headers.forEach((v, k) => {
+      headersObj[k] = v;
+    });
+    return jsonResponse(
+      {
+        requestedUrl: queryUrl,
+        status: res.status,
+        statusText: res.statusText,
+        responseHeaders: headersObj,
+        bodyPreview: text.slice(0, 800),
+        bodyLength: text.length,
+      },
+      200
+    );
+  } catch (err) {
+    return jsonResponse(
+      { requestedUrl: queryUrl, networkError: err.message, networkErrorName: err.name },
+      200
+    );
+  }
+}
 
 // ── COT (Commitment of Traders) ──────────────────────────────────────────
 async function proxyCot(env) {
