@@ -39,18 +39,25 @@ const CFTC_TFF_URL = "https://publicreporting.cftc.gov/resource/gpe5-46if.json";
 
 // Maps our terminal's symbols to CFTC's "Market_and_Exchange_Names" text.
 // CFTC uses full descriptive names, not tickers, so we match by substring.
+// IMPORTANT: CFTC publishes BOTH standalone currency futures (e.g. "EURO FX")
+// AND separate cross-rate contracts (e.g. "EURO FX/JAPANESE YEN XRATE"). A
+// plain substring match on "JAPANESE YEN" matches the EUR/JPY cross-rate
+// contract too — and since that row often sorts earlier, it was winning by
+// mistake for both EURUSD and USDJPY. findFirstMatchingRow() now skips any
+// market name containing "/" or "XRATE" so only the real standalone
+// currency futures (CME codes 6E, 6B, 6J, 6A, 6C, 6S, 6N) can match.
 const COT_SYMBOL_MAP = {
   EURUSD: "EURO FX",
-  GBPUSD: "BRITISH POUND",
+  GBPUSD: "BRITISH POUND STERLING",
   USDJPY: "JAPANESE YEN",
   AUDUSD: "AUSTRALIAN DOLLAR",
   USDCAD: "CANADIAN DOLLAR",
   USDCHF: "SWISS FRANC",
   NZDUSD: "NEW ZEALAND DOLLAR",
   DXY: "USD INDEX",
-  NAS100: "NASDAQ-100",
-  SP500: "E-MINI S&P 500",
-  US30: "DOW JONES",
+  NAS100: "NASDAQ-100 STOCK INDEX",
+  SP500: "S&P 500 STOCK INDEX",
+  US30: "DOW JONES INDUSTRIAL AVG",
   US10Y: "10-YEAR U.S. TREASURY NOTES",
   US30Y: "ULTRA U.S. TREASURY BONDS",
   XAUUSD: "GOLD",
@@ -319,8 +326,13 @@ function findFirstMatchingRow(rows, needle) {
   let firstMatch = null;
   const newestDate = rows.length > 0 ? rows[0].report_date_as_yyyy_mm_dd : null;
   for (let i = 0; i < rows.length; i++) {
-    const name = rows[i].market_and_exchange_names || "";
-    if (name.toUpperCase().indexOf(upperNeedle) !== -1) {
+    const name = (rows[i].market_and_exchange_names || "").toUpperCase();
+    // Skip cross-rate contracts (e.g. "EURO FX/JAPANESE YEN XRATE") so a
+    // plain currency name like "JAPANESE YEN" only matches the real
+    // standalone Japanese Yen futures, not every cross-rate pair that
+    // happens to mention yen.
+    if (name.indexOf("/") !== -1 || name.indexOf("XRATE") !== -1) continue;
+    if (name.indexOf(upperNeedle) !== -1) {
       if (!firstMatch) firstMatch = rows[i];
       // Prefer an exact newest-date match if we find one
       if (newestDate && rows[i].report_date_as_yyyy_mm_dd === newestDate) {
