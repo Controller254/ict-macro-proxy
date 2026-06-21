@@ -230,16 +230,18 @@ async function proxyCot(env) {
     return jsonResponse({ error: { message: "CFTC source returned unexpected shape." } }, 502);
   }
 
-  // Sanity check: confirm rows are actually sorted newest-first now that
-  // $order is correctly encoded. If the most recent date is more than ~10
-  // days old, something is still wrong upstream (CFTC publishes weekly,
-  // every Friday) — surface that clearly instead of silently serving stale
-  // legacy data again.
+  // Sanity check: confirm rows are actually sorted newest-first. CFTC
+  // publishes Fridays for the prior Tuesday's positions, so under normal
+  // conditions the newest row is 3-4 days old. But report weeks can stack
+  // (e.g. right after a holiday delay) and 12+ day gaps between when we
+  // check and when the next Friday release lands are normal, not a bug.
+  // 16 days gives headroom for a single missed/delayed release before this
+  // flags something as genuinely wrong upstream.
   const newestDate = rows.length > 0 ? rows[0].report_date_as_yyyy_mm_dd : null;
   if (newestDate) {
     const ageMs = now - new Date(newestDate).getTime();
     const ageDays = ageMs / (24 * 60 * 60 * 1000);
-    if (ageDays > 10 || ageDays < -1) {
+    if (ageDays > 16 || ageDays < -1) {
       if (cached && cached.data) {
         return jsonResponse(cached.data, 200, { "X-Cache": "STALE-SUSPICIOUS-DATE" });
       }
