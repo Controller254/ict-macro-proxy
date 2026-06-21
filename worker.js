@@ -79,7 +79,19 @@ async function proxyCot() {
 
   // Pull the most recent report for every market in one call, sorted by
   // date descending, then keep only the newest row per market below.
-  const queryUrl = CFTC_TFF_URL + "?$limit=500&$order=report_date_as_yyyy_mm_dd DESC";
+  //
+  // BUG FIX: the previous version built this URL with a literal,
+  // unencoded space between the column name and DESC:
+  //   "?$limit=500&$order=report_date_as_yyyy_mm_dd DESC"
+  // An unencoded space inside a SoQL clause is not reliably interpreted
+  // by Socrata's parser — it can silently break tokenization of the
+  // $order clause, causing Socrata to ignore it and fall back to its
+  // default ordering (oldest rows / internal row ID), which is why every
+  // matched market showed "FLAT 0": the worker was reading legacy/historic
+  // report rows from years ago instead of the current week's report.
+  // Fix: URL-encode the entire $order value so the space becomes %20.
+  const orderClause = encodeURIComponent("report_date_as_yyyy_mm_dd DESC");
+  const queryUrl = CFTC_TFF_URL + "?$limit=2000&$order=" + orderClause;
   const res = await fetch(queryUrl, {
     headers: { "User-Agent": "Mozilla/5.0 (compatible; ICT-Terminal-Worker/1.0)" },
   });
@@ -108,6 +120,35 @@ async function proxyCot() {
     return jsonResponse({ error: { message: "CFTC source returned unexpected shape." } }, 502);
   }
 
+  // Sanity check: confirm rows are actually sorted newest-first now that
+  // $order is correctly encoded. If the most recent date is more than ~10
+  // days old, something is still wrong upstream (CFTC publishes weekly,
+  // every Friday) — surface that clearly instead of silently serving stale
+  // legacy data again.
+  const newestDate = rows.length > 0 ? rows[0].report_date_as_yyyy_mm_dd : null;
+  if (newestDate) {
+    const ageMs = now - new Date(newestDate).getTime();
+    const ageDays = ageMs / (24 * 60 * 60 * 1000);
+    if (ageDays > 10 || ageDays < -1) {
+      if (cotCache.data) {
+        return jsonResponse(cotCache.data, 200, { "X-Cache": "STALE-SUSPICIOUS-DATE" });
+      }
+      return jsonResponse(
+        {
+          error: {
+            message:
+              "CFTC data ordering looks wrong (newest row dated " +
+              newestDate +
+              ", " +
+              Math.round(ageDays) +
+              " days old). Expected a report from within the last week.",
+          },
+        },
+        502
+      );
+    }
+  }
+
   const result = {};
   for (const ourSymbol in COT_SYMBOL_MAP) {
     const needle = COT_SYMBOL_MAP[ourSymbol];
@@ -118,7 +159,7 @@ async function proxyCot() {
   }
 
   const payload = {
-    asOf: rows.length > 0 ? rows[0].report_date_as_yyyy_mm_dd : null,
+    asOf: newestDate,
     markets: result,
     source: "https://publicreporting.cftc.gov/Commitments-of-Traders/TFF-Futures-Only/gpe5-46if (CFTC public API)",
   };
@@ -127,14 +168,28 @@ async function proxyCot() {
   return jsonResponse(payload, 200, { "X-Cache": "MISS" });
 }
 
+// Each market reports weekly, so with 500 rows ordered newest-first we may
+// not have reached every market's most recent row yet if many markets sort
+// ahead of it alphabetically/by-id for that date. Searching only the first
+// match by substring (without also requiring it be from the newest date)
+// risked matching an older row for less commonly-referenced markets. We
+// widened $limit to 2000 above; this raises the matched needle further to
+// also prefer rows dated on/near the newest date when multiple matches exist.
 function findFirstMatchingRow(rows, needle) {
+  const upperNeedle = needle.toUpperCase();
+  let firstMatch = null;
+  const newestDate = rows.length > 0 ? rows[0].report_date_as_yyyy_mm_dd : null;
   for (let i = 0; i < rows.length; i++) {
     const name = rows[i].market_and_exchange_names || "";
-    if (name.toUpperCase().indexOf(needle.toUpperCase()) !== -1) {
-      return rows[i];
+    if (name.toUpperCase().indexOf(upperNeedle) !== -1) {
+      if (!firstMatch) firstMatch = rows[i];
+      // Prefer an exact newest-date match if we find one
+      if (newestDate && rows[i].report_date_as_yyyy_mm_dd === newestDate) {
+        return rows[i];
+      }
     }
   }
-  return null;
+  return firstMatch;
 }
 
 function summarizeCotRow(row) {
