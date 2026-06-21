@@ -346,10 +346,17 @@ function findFirstMatchingRow(rows, needle) {
 function summarizeCotRow(row) {
   const num = (v) => (v === undefined || v === null || v === "" ? 0 : parseInt(v, 10));
 
-  const assetMgrLong = num(row.asset_mgr_positions_long_all);
-  const assetMgrShort = num(row.asset_mgr_positions_short_all);
-  const levMoneyLong = num(row.lev_money_positions_long_all);
-  const levMoneyShort = num(row.lev_money_positions_short_all);
+  // IMPORTANT: CFTC's actual field names are inconsistent across trader
+  // categories — dealer_positions_long_all/short_all DO have an "_all"
+  // suffix, but asset_mgr_positions_long/short and lev_money_positions_
+  // long/short do NOT. Reading the wrong (nonexistent) field name silently
+  // returned undefined -> 0 for every market, which is why Asset Manager
+  // and Leveraged Funds always showed flat/zero before. Confirmed directly
+  // against CFTC's own x-soda2-fields header via /cot-debug.
+  const assetMgrLong = num(row.asset_mgr_positions_long);
+  const assetMgrShort = num(row.asset_mgr_positions_short);
+  const levMoneyLong = num(row.lev_money_positions_long);
+  const levMoneyShort = num(row.lev_money_positions_short);
   const dealerLong = num(row.dealer_positions_long_all);
   const dealerShort = num(row.dealer_positions_short_all);
 
