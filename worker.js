@@ -13,6 +13,34 @@ const NEWS_SOURCES = [
 let calendarCache = { data: null, fetchedAt: 0 };
 const CALENDAR_CACHE_MS = 5 * 60 * 1000;
 
+let cotCache = { data: null, fetchedAt: 0 };
+const COT_CACHE_MS = 60 * 60 * 1000; // COT updates once a week (Fri), 1hr cache is plenty
+
+// CFTC's Traders in Financial Futures (TFF) dataset, Socrata Open Data API.
+// Free, public, no key, no login - government open data.
+// https://publicreporting.cftc.gov/Commitments-of-Traders/TFF-Futures-Only/gpe5-46if
+const CFTC_TFF_URL = "https://publicreporting.cftc.gov/resource/gpe5-46if.json";
+
+// Maps our terminal's symbols to CFTC's "Market_and_Exchange_Names" text.
+// CFTC uses full descriptive names, not tickers, so we match by substring.
+const COT_SYMBOL_MAP = {
+  EURUSD: "EURO FX",
+  GBPUSD: "BRITISH POUND",
+  USDJPY: "JAPANESE YEN",
+  AUDUSD: "AUSTRALIAN DOLLAR",
+  USDCAD: "CANADIAN DOLLAR",
+  USDCHF: "SWISS FRANC",
+  NZDUSD: "NEW ZEALAND DOLLAR",
+  DXY: "USD INDEX",
+  NAS100: "NASDAQ-100",
+  SP500: "E-MINI S&P 500",
+  US30: "DOW JONES",
+  US10Y: "10-YEAR U.S. TREASURY NOTES",
+  US30Y: "ULTRA U.S. TREASURY BONDS",
+  XAUUSD: "GOLD",
+  XAGUSD: "SILVER",
+};
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -26,14 +54,14 @@ export default {
       if (url.pathname === "/news") {
         return await proxyNews();
       }
+      if (url.pathname === "/cot") {
+        return await proxyCot();
+      }
       if (url.pathname === "/fxssi-raw") {
         return await fetchFxssiRaw();
       }
-      if (url.pathname === "/sentiment") {
-        return await proxySentimentFxssi();
-      }
       return jsonResponse(
-        { error: { message: "Unknown endpoint. Use /calendar, /news, /sentiment, or /fxssi-raw." } },
+        { error: { message: "Unknown endpoint. Use /calendar, /news, /cot, or /fxssi-raw." } },
         404
       );
     } catch (err) {
@@ -42,87 +70,94 @@ export default {
   },
 };
 
-// Returns the raw HTML FXSSI sends back, so we can inspect with our own
-// eyes whether the percentages exist in the server response or only
-// appear after client-side JavaScript runs in a real browser.
-async function fetchFxssiRaw() {
-  const res = await fetch("https://fxssi.com/tools/current-ratio", {
-    headers: {
-      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
-      Accept: "text/html,application/xhtml+xml",
-    },
-  });
-  const html = await res.text();
-  const hasPercent = html.indexOf("%") !== -1;
-  const hasEURUSD = html.indexOf("EURUSD") !== -1;
-
-  // Jump straight to the first occurrence of EURUSD in the page and show
-  // the 3000 characters AROUND it, instead of the page <head> metadata.
-  const eurusdIdx = html.indexOf("EURUSD");
-  let snippet;
-  if (eurusdIdx !== -1) {
-    const start = Math.max(0, eurusdIdx - 500);
-    const end = Math.min(html.length, eurusdIdx + 2500);
-    snippet = html.slice(start, end);
-  } else {
-    snippet = html.length > 3000 ? html.slice(0, 3000) : html;
+// ── COT (Commitment of Traders) ──────────────────────────────────────────
+async function proxyCot() {
+  const now = Date.now();
+  if (cotCache.data && now - cotCache.fetchedAt < COT_CACHE_MS) {
+    return jsonResponse(cotCache.data, 200, { "X-Cache": "HIT" });
   }
 
-  return jsonResponse(
-    {
-      status: res.status,
-      htmlLength: html.length,
-      containsPercentSign: hasPercent,
-      containsEURUSD: hasEURUSD,
-      eurusdFirstIndex: eurusdIdx,
-      snippetAroundEURUSD: snippet,
-    },
-    200
-  );
-}
-
-async function proxySentimentFxssi() {
-  const res = await fetch("https://fxssi.com/tools/current-ratio", {
-    headers: {
-      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
-      Accept: "text/html",
-    },
+  // Pull the most recent report for every market in one call, sorted by
+  // date descending, then keep only the newest row per market below.
+  const queryUrl = CFTC_TFF_URL + "?$limit=500&$order=report_date_as_yyyy_mm_dd DESC";
+  const res = await fetch(queryUrl, {
+    headers: { "User-Agent": "Mozilla/5.0 (compatible; ICT-Terminal-Worker/1.0)" },
   });
+
   if (!res.ok) {
-    return jsonResponse({ error: { message: "FXSSI returned " + res.status } }, 502);
+    if (cotCache.data) {
+      return jsonResponse(cotCache.data, 200, { "X-Cache": "STALE-ON-ERROR" });
+    }
+    return jsonResponse({ error: { message: "CFTC source returned " + res.status } }, 502);
   }
-  const html = await res.text();
-  const pairs = parseFxssiSentiment(html);
-  if (Object.keys(pairs).length === 0) {
-    return jsonResponse(
-      {
-        error: {
-          message: "Could not find sentiment percentages in FXSSI's server response. The data may load via client-side JavaScript only.",
-        },
-      },
-      502
-    );
-  }
-  return jsonResponse({ pairs: pairs, source: "https://fxssi.com/tools/current-ratio" }, 200);
-}
 
-function parseFxssiSentiment(html) {
+  let rows;
+  try {
+    rows = await res.json();
+  } catch (e) {
+    if (cotCache.data) {
+      return jsonResponse(cotCache.data, 200, { "X-Cache": "STALE-PARSE-ERROR" });
+    }
+    return jsonResponse({ error: { message: "CFTC source returned unparseable data: " + e.message } }, 502);
+  }
+
+  if (!Array.isArray(rows)) {
+    if (cotCache.data) {
+      return jsonResponse(cotCache.data, 200, { "X-Cache": "STALE-SHAPE-ERROR" });
+    }
+    return jsonResponse({ error: { message: "CFTC source returned unexpected shape." } }, 502);
+  }
+
   const result = {};
-  const pattern = /([A-Z]{6})[^0-9%]{0,300}?(\d{1,3})\s*%[^0-9%]{0,60}?(\d{1,3})\s*%/g;
-  let match;
-  const seen = {};
-  while ((match = pattern.exec(html)) !== null) {
-    const symbol = match[1];
-    const buy = parseInt(match[2], 10);
-    const sell = parseInt(match[3], 10);
-    if (seen[symbol]) continue;
-    if (buy + sell !== 100) continue;
-    seen[symbol] = true;
-    result[symbol] = { buyPct: buy, sellPct: sell };
+  for (const ourSymbol in COT_SYMBOL_MAP) {
+    const needle = COT_SYMBOL_MAP[ourSymbol];
+    const match = findFirstMatchingRow(rows, needle);
+    if (match) {
+      result[ourSymbol] = summarizeCotRow(match);
+    }
   }
-  return result;
+
+  const payload = {
+    asOf: rows.length > 0 ? rows[0].report_date_as_yyyy_mm_dd : null,
+    markets: result,
+    source: "https://publicreporting.cftc.gov/Commitments-of-Traders/TFF-Futures-Only/gpe5-46if (CFTC public API)",
+  };
+
+  cotCache = { data: payload, fetchedAt: now };
+  return jsonResponse(payload, 200, { "X-Cache": "MISS" });
 }
 
+function findFirstMatchingRow(rows, needle) {
+  for (let i = 0; i < rows.length; i++) {
+    const name = rows[i].market_and_exchange_names || "";
+    if (name.toUpperCase().indexOf(needle.toUpperCase()) !== -1) {
+      return rows[i];
+    }
+  }
+  return null;
+}
+
+function summarizeCotRow(row) {
+  const num = (v) => (v === undefined || v === null || v === "" ? 0 : parseInt(v, 10));
+
+  const assetMgrLong = num(row.asset_mgr_positions_long_all);
+  const assetMgrShort = num(row.asset_mgr_positions_short_all);
+  const levMoneyLong = num(row.lev_money_positions_long_all);
+  const levMoneyShort = num(row.lev_money_positions_short_all);
+  const dealerLong = num(row.dealer_positions_long_all);
+  const dealerShort = num(row.dealer_positions_short_all);
+
+  return {
+    marketName: row.market_and_exchange_names,
+    reportDate: row.report_date_as_yyyy_mm_dd,
+    openInterest: num(row.open_interest_all),
+    assetManager: { long: assetMgrLong, short: assetMgrShort, net: assetMgrLong - assetMgrShort },
+    leveragedFunds: { long: levMoneyLong, short: levMoneyShort, net: levMoneyLong - levMoneyShort },
+    dealer: { long: dealerLong, short: dealerShort, net: dealerLong - dealerShort },
+  };
+}
+
+// ── CALENDAR ──────────────────────────────────────────────────────────────
 async function proxyCalendar() {
   const now = Date.now();
   if (calendarCache.data && now - calendarCache.fetchedAt < CALENDAR_CACHE_MS) {
@@ -167,6 +202,7 @@ async function proxyCalendar() {
   return jsonResponse(data, 200, { "X-Cache": "MISS" });
 }
 
+// ── NEWS ──────────────────────────────────────────────────────────────────
 async function proxyNews() {
   const errors = [];
   for (let i = 0; i < NEWS_SOURCES.length; i++) {
@@ -233,6 +269,19 @@ function decodeEntities(s) {
     .replace(/&apos;/g, "'");
 }
 
+// ── FXSSI DEBUG (kept for now, harmless) ───────────────────────────────────
+async function fetchFxssiRaw() {
+  const res = await fetch("https://fxssi.com/tools/current-ratio", {
+    headers: {
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+      Accept: "text/html,application/xhtml+xml",
+    },
+  });
+  const html = await res.text();
+  return jsonResponse({ status: res.status, htmlLength: html.length }, 200);
+}
+
+// ── HELPERS ──────────────────────────────────────────────────────────────
 function jsonResponse(body, status, extraHeaders) {
   const headers = { "Content-Type": "application/json" };
   for (const k in CORS_HEADERS) {
