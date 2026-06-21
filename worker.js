@@ -482,8 +482,28 @@ async function proxyRetail(env) {
 // Diagnostic endpoint — surfaces exactly where in the login -> outlook
 // chain things fail, with the real Myfxbook message, rather than the
 // terminal seeing only a generic 502.
+//
+// Also reports SAFE metadata about the two secrets (length, and the char
+// code of the first/last character) WITHOUT ever exposing the actual
+// value — this exists purely to catch a stray trailing space, smart-quote,
+// or newline that got pasted into the Cloudflare secret field, which
+// looks identical to the correct value on screen but fails byte-for-byte
+// comparison against what Myfxbook expects.
+function safeSecretInfo(value) {
+  if (!value) return null;
+  return {
+    length: value.length,
+    firstCharCode: value.charCodeAt(0),
+    lastCharCode: value.charCodeAt(value.length - 1),
+    hasLeadingWhitespace: /^\s/.test(value),
+    hasTrailingWhitespace: /\s$/.test(value),
+  };
+}
+
 async function debugRetail(env) {
   const out = { hasEmailSecret: !!env.MYFXBOOK_EMAIL, hasPasswordSecret: !!env.MYFXBOOK_PASSWORD };
+  out.emailSecretInfo = safeSecretInfo(env.MYFXBOOK_EMAIL);
+  out.passwordSecretInfo = safeSecretInfo(env.MYFXBOOK_PASSWORD);
   try {
     const cached = await getCachedSession(env);
     out.cachedSessionPresent = !!(cached && cached.session);
