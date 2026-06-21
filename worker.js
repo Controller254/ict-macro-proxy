@@ -64,6 +64,42 @@ const COT_SYMBOL_MAP = {
   XAGUSD: "SILVER",
 };
 
+// ── MYFXBOOK COMMUNITY OUTLOOK ───────────────────────────────────────────
+// Real retail long/short positioning, free tier: 100 requests/day.
+// Requires a registered myfxbook.com account — credentials are read from
+// Worker secrets (env.MYFXBOOK_EMAIL / env.MYFXBOOK_PASSWORD), never
+// hardcoded here, so they never end up in the GitHub repo this Worker
+// deploys from. Set them with:
+//   wrangler secret put MYFXBOOK_EMAIL
+//   wrangler secret put MYFXBOOK_PASSWORD
+// or via the Cloudflare dashboard: Worker -> Settings -> Variables ->
+// Encrypt the variable.
+//
+// Sessions are IP-bound and last 1 month (per Myfxbook's Oct 2025 API
+// update) — cached in the same COT_KV namespace under a different key so
+// we log in once and reuse the session across requests/isolates, rather
+// than spending a login call every time (logins likely count against the
+// same rate budget as data calls, though Myfxbook doesn't document this
+// explicitly — caching aggressively is the safe assumption either way).
+const RETAIL_SESSION_KEY = "myfxbook_session";
+const RETAIL_DATA_KEY = "myfxbook_retail_latest";
+const RETAIL_DATA_CACHE_MS = 10 * 60 * 1000; // Myfxbook's own outlook refresh cadence is ~10min server-side
+
+// Maps Myfxbook's outlook symbol names to our terminal's symbols. Myfxbook
+// only covers FX majors/minors and a few metals — it has no equity index
+// or bond coverage, unlike COT, so this list is intentionally shorter.
+const RETAIL_SYMBOL_MAP = {
+  EURUSD: "EURUSD",
+  GBPUSD: "GBPUSD",
+  USDJPY: "USDJPY",
+  AUDUSD: "AUDUSD",
+  USDCAD: "USDCAD",
+  USDCHF: "USDCHF",
+  NZDUSD: "NZDUSD",
+  XAUUSD: "XAUUSD",
+  XAGUSD: "XAGUSD",
+};
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -86,8 +122,14 @@ export default {
       if (url.pathname === "/fxssi-raw") {
         return await fetchFxssiRaw();
       }
+      if (url.pathname === "/retail") {
+        return await proxyRetail(env);
+      }
+      if (url.pathname === "/retail-debug") {
+        return await debugRetail(env);
+      }
       return jsonResponse(
-        { error: { message: "Unknown endpoint. Use /calendar, /news, /cot, /cot-debug, or /fxssi-raw." } },
+        { error: { message: "Unknown endpoint. Use /calendar, /news, /cot, /cot-debug, /fxssi-raw, /retail, or /retail-debug." } },
         404
       );
     } catch (err) {
@@ -286,6 +328,179 @@ function summarizeCotRow(row) {
     leveragedFunds: { long: levMoneyLong, short: levMoneyShort, net: levMoneyLong - levMoneyShort },
     dealer: { long: dealerLong, short: dealerShort, net: dealerLong - dealerShort },
   };
+}
+
+// ── MYFXBOOK RETAIL POSITIONING ──────────────────────────────────────────
+async function getCachedSession(env) {
+  try {
+    if (!env.COT_KV) return null;
+    const raw = await env.COT_KV.get(RETAIL_SESSION_KEY);
+    if (!raw) return null;
+    return JSON.parse(raw); // { session, loggedInAt }
+  } catch (e) {
+    return null;
+  }
+}
+async function setCachedSession(env, session) {
+  try {
+    if (!env.COT_KV) return;
+    await env.COT_KV.put(RETAIL_SESSION_KEY, JSON.stringify({ session, loggedInAt: Date.now() }));
+  } catch (e) {
+    // non-fatal
+  }
+}
+async function clearCachedSession(env) {
+  try {
+    if (!env.COT_KV) return;
+    await env.COT_KV.delete(RETAIL_SESSION_KEY);
+  } catch (e) {
+    // non-fatal
+  }
+}
+
+// Logs in fresh and caches the resulting session. Throws with the real
+// Myfxbook error message on failure (e.g. "Wrong email/password") rather
+// than a generic network error, since that distinction matters for
+// diagnosing a misconfigured secret vs an actual outage.
+async function myfxbookLogin(env) {
+  if (!env.MYFXBOOK_EMAIL || !env.MYFXBOOK_PASSWORD) {
+    throw new Error(
+      "MYFXBOOK_EMAIL / MYFXBOOK_PASSWORD secrets are not set on this Worker. Set them via `wrangler secret put MYFXBOOK_EMAIL` (and PASSWORD), or in the Cloudflare dashboard under Worker -> Settings -> Variables."
+    );
+  }
+  const loginUrl =
+    "https://www.myfxbook.com/api/login.json?email=" +
+    encodeURIComponent(env.MYFXBOOK_EMAIL) +
+    "&password=" +
+    encodeURIComponent(env.MYFXBOOK_PASSWORD);
+  const res = await fetch(loginUrl);
+  if (!res.ok) throw new Error("Myfxbook login HTTP " + res.status);
+  const data = await res.json();
+  if (data.error) throw new Error("Myfxbook login rejected: " + (data.message || "unknown reason"));
+  if (!data.session) throw new Error("Myfxbook login returned no session token");
+  await setCachedSession(env, data.session);
+  return data.session;
+}
+
+// Tries the cached session first; if Myfxbook reports it invalid/expired,
+// logs in fresh exactly once and retries. This keeps normal operation to
+// zero logins per request (session lasts ~1 month) while still
+// self-healing after expiry without manual intervention.
+async function getCommunityOutlook(env) {
+  const cached = await getCachedSession(env);
+  let session = cached && cached.session;
+
+  if (!session) {
+    session = await myfxbookLogin(env);
+  }
+
+  let res = await fetch(
+    "https://www.myfxbook.com/api/get-community-outlook.json?session=" + encodeURIComponent(session)
+  );
+  let data = await res.json();
+
+  if (data.error && /session/i.test(data.message || "")) {
+    // Cached session expired/invalid — log in fresh once and retry.
+    await clearCachedSession(env);
+    session = await myfxbookLogin(env);
+    res = await fetch(
+      "https://www.myfxbook.com/api/get-community-outlook.json?session=" + encodeURIComponent(session)
+    );
+    data = await res.json();
+  }
+
+  if (data.error) {
+    throw new Error("Myfxbook get-community-outlook error: " + (data.message || "unknown reason"));
+  }
+  return data;
+}
+
+async function proxyRetail(env) {
+  const now = Date.now();
+
+  // Serve from cache if fresh — Myfxbook's own data refreshes ~every 10min,
+  // no point hitting their API more often than that.
+  try {
+    if (env.COT_KV) {
+      const raw = await env.COT_KV.get(RETAIL_DATA_KEY);
+      if (raw) {
+        const cached = JSON.parse(raw);
+        if (now - cached.fetchedAt < RETAIL_DATA_CACHE_MS) {
+          return jsonResponse(cached.payload, 200, { "X-Cache": "HIT" });
+        }
+      }
+    }
+  } catch (e) {
+    // fall through to a live fetch if cache read fails for any reason
+  }
+
+  let outlook;
+  try {
+    outlook = await getCommunityOutlook(env);
+  } catch (err) {
+    // Stale-on-error: if we have ANY previous successful data, prefer
+    // serving that over a hard failure — same pattern as /calendar.
+    try {
+      if (env.COT_KV) {
+        const raw = await env.COT_KV.get(RETAIL_DATA_KEY);
+        if (raw) {
+          const cached = JSON.parse(raw);
+          return jsonResponse(cached.payload, 200, { "X-Cache": "STALE-ON-ERROR" });
+        }
+      }
+    } catch (e2) {
+      // no stale copy available either
+    }
+    return jsonResponse({ error: { message: err.message } }, 502);
+  }
+
+  const symbols = {};
+  (outlook.symbols || []).forEach((s) => {
+    const ourSym = Object.keys(RETAIL_SYMBOL_MAP).find((k) => RETAIL_SYMBOL_MAP[k] === s.name);
+    if (ourSym) {
+      symbols[ourSym] = {
+        longPercentage: s.longPercentage,
+        shortPercentage: s.shortPercentage,
+        longVolume: s.longVolume,
+        shortVolume: s.shortVolume,
+        totalPositions: s.totalPositions,
+      };
+    }
+  });
+
+  const payload = { symbols, fetchedAt: now };
+  try {
+    if (env.COT_KV) {
+      await env.COT_KV.put(RETAIL_DATA_KEY, JSON.stringify({ payload, fetchedAt: now }));
+    }
+  } catch (e) {
+    // non-fatal
+  }
+  return jsonResponse(payload, 200, { "X-Cache": "MISS" });
+}
+
+// Diagnostic endpoint — surfaces exactly where in the login -> outlook
+// chain things fail, with the real Myfxbook message, rather than the
+// terminal seeing only a generic 502.
+async function debugRetail(env) {
+  const out = { hasEmailSecret: !!env.MYFXBOOK_EMAIL, hasPasswordSecret: !!env.MYFXBOOK_PASSWORD };
+  try {
+    const cached = await getCachedSession(env);
+    out.cachedSessionPresent = !!(cached && cached.session);
+    out.cachedSessionAgeMs = cached ? Date.now() - cached.loggedInAt : null;
+  } catch (e) {
+    out.cacheReadError = e.message;
+  }
+  try {
+    const outlook = await getCommunityOutlook(env);
+    out.loginAndFetchSucceeded = true;
+    out.symbolCount = (outlook.symbols || []).length;
+    out.sampleSymbol = (outlook.symbols || [])[0] || null;
+  } catch (err) {
+    out.loginAndFetchSucceeded = false;
+    out.error = err.message;
+  }
+  return jsonResponse(out, 200);
 }
 
 // ── CALENDAR ──────────────────────────────────────────────────────────────
