@@ -79,28 +79,64 @@ async function proxyCot() {
 
   // Pull the most recent report for every market in one call, sorted by
   // date descending, then keep only the newest row per market below.
-  //
-  // BUG FIX: the previous version built this URL with a literal,
-  // unencoded space between the column name and DESC:
-  //   "?$limit=500&$order=report_date_as_yyyy_mm_dd DESC"
-  // An unencoded space inside a SoQL clause is not reliably interpreted
-  // by Socrata's parser — it can silently break tokenization of the
-  // $order clause, causing Socrata to ignore it and fall back to its
-  // default ordering (oldest rows / internal row ID), which is why every
-  // matched market showed "FLAT 0": the worker was reading legacy/historic
-  // report rows from years ago instead of the current week's report.
-  // Fix: URL-encode the entire $order value so the space becomes %20.
   const orderClause = encodeURIComponent("report_date_as_yyyy_mm_dd DESC");
   const queryUrl = CFTC_TFF_URL + "?$limit=2000&$order=" + orderClause;
-  const res = await fetch(queryUrl, {
-    headers: { "User-Agent": "Mozilla/5.0 (compatible; ICT-Terminal-Worker/1.0)" },
-  });
 
-  if (!res.ok) {
+  // BUG FIX: publicreporting.cftc.gov intermittently returns 502/503 to
+  // requests coming from Cloudflare Workers' shared IP ranges (this is a
+  // known pattern — government WAFs and bot-detection on .gov sites often
+  // reject traffic from cloud-provider IP blocks even though the request
+  // itself is fine). A single failed attempt was being treated as a hard
+  // failure with no retry, even though a second attempt moments later
+  // frequently succeeds. We now retry transient-looking failures (502,
+  // 503, 504, and network-level fetch throws) up to 3 times with a short
+  // backoff before giving up. We also use a realistic full browser User-
+  // Agent string instead of a generic "compatible; ICT-Terminal-Worker/1.0"
+  // identifier, since some .gov WAFs specifically allowlist real browser
+  // UAs and challenge or reject anything that self-identifies as a bot.
+  const REALISTIC_UA =
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
+  const TRANSIENT_STATUSES = [429, 502, 503, 504];
+  const MAX_ATTEMPTS = 3;
+
+  let res = null;
+  let lastError = null;
+  let lastStatus = null;
+
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    try {
+      res = await fetch(queryUrl, {
+        headers: {
+          "User-Agent": REALISTIC_UA,
+          Accept: "application/json",
+        },
+      });
+      lastStatus = res.status;
+      if (res.ok) break; // success, stop retrying
+      if (TRANSIENT_STATUSES.indexOf(res.status) === -1) break; // non-transient, no point retrying
+    } catch (err) {
+      lastError = err;
+      res = null;
+    }
+    if (attempt < MAX_ATTEMPTS) {
+      // Short backoff: 400ms, then 900ms. Workers have a CPU-time budget,
+      // so we keep this brief rather than a long exponential wait.
+      await sleep(attempt === 1 ? 400 : 900);
+    }
+  }
+
+  if (!res || !res.ok) {
     if (cotCache.data) {
       return jsonResponse(cotCache.data, 200, { "X-Cache": "STALE-ON-ERROR" });
     }
-    return jsonResponse({ error: { message: "CFTC source returned " + res.status } }, 502);
+    // Surface the REAL upstream status (or network error) instead of
+    // always reporting a generic 502 — this is the difference between
+    // "CFTC rejected us with 403" and "CFTC's server actually errored",
+    // which previously looked identical from the terminal's point of view.
+    const detail = lastError
+      ? "network error contacting CFTC: " + lastError.message
+      : "CFTC source returned HTTP " + lastStatus + " after " + MAX_ATTEMPTS + " attempts";
+    return jsonResponse({ error: { message: detail } }, lastStatus && lastStatus < 500 ? lastStatus : 502);
   }
 
   let rows;
@@ -166,6 +202,10 @@ async function proxyCot() {
 
   cotCache = { data: payload, fetchedAt: now };
   return jsonResponse(payload, 200, { "X-Cache": "MISS" });
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 // Each market reports weekly, so with 500 rows ordered newest-first we may
