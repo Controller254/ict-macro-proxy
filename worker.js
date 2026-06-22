@@ -99,6 +99,7 @@ async function proxyCot(env) {
   const whereClause = needles
     .map((n) => "upper(market_and_exchange_names) like '%" + n.toUpperCase().replace(/'/g, "''") + "%'")
     .join(" OR ");
+  const orderClause = encodeURIComponent("report_date_as_yyyy_mm_dd DESC");
   const queryUrl =
     CFTC_TFF_URL +
     "?$limit=2000&$order=" +
