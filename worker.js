@@ -13,48 +13,84 @@ const NEWS_SOURCES = [
 let calendarCache = { data: null, fetchedAt: 0 };
 const CALENDAR_CACHE_MS = 5 * 60 * 1000;
 
-// NOTE: COT caching now lives in Workers KV (env.COT_KV), NOT a module-level
-// variable. Cloudflare Workers are stateless across invocations — a plain
-// JS variable like `let cotCache = {...}` only survives within a single
-// isolate, and Cloudflare may route different requests to different
-// isolates (or evict/recreate an isolate) at any time with no warning.
-// That meant our in-memory cache was silently useless for most requests:
-// the "TEST WORKER CONNECTION" button could hit a fresh isolate that
-// happened to reach CFTC successfully, while the next real request from
-// the terminal hit a DIFFERENT isolate with an empty cache, retried CFTC
-// fresh, hit CFTC's intermittent WAF rejection again, and surfaced a 502
-// to the user — even though "the worker is definitely fetching CFTC fine"
-// from the dashboard's point of view a moment earlier.
-// Workers KV is real durable storage shared across all isolates, so once
-// ANY request succeeds, every other invocation — anywhere — sees the
-// cached data immediately. This is the actual fix for the 502s, not just
-// the retry/backoff logic below (which still helps for cold-cache misses).
-const COT_CACHE_KEY = "cot_latest";
+let cotCache = { data: null, fetchedAt: 0 };
 const COT_CACHE_MS = 60 * 60 * 1000; // COT updates once a week (Fri), 1hr cache is plenty
+
+let pricesCache = { data: null, fetchedAt: 0 };
+const PRICES_CACHE_MS = 15 * 1000; // 15s - short enough to feel live, long enough to avoid hammering Yahoo
+
+// Live prices: Yahoo Finance's unofficial chart endpoint (the same one the
+// `yfinance` Python library uses under the hood). It is NOT a documented
+// public API and Yahoo can change/throttle it without notice - but it is
+// free, keyless, and as of 2026 still the most reliable no-signup source
+// for forex/indices/yields. Running it HERE (server-side, in the Worker)
+// rather than from the browser solves the real reliability problems:
+// no CORS issues, no per-user-IP rate limiting, and if Yahoo ever breaks
+// we can swap the source in one place without the terminal knowing.
+//
+// Crypto is NOT included here - the terminal already gets that for free,
+// live, with no key, directly from Binance's public WebSocket.
+const YAHOO_SYMBOL_MAP = {
+  EURUSD: "EURUSD=X",
+  GBPUSD: "GBPUSD=X",
+  USDJPY: "USDJPY=X",
+  AUDUSD: "AUDUSD=X",
+  USDCAD: "USDCAD=X",
+  USDCHF: "USDCHF=X",
+  NZDUSD: "NZDUSD=X",
+  XAUUSD: "GC=F", // Gold futures (continuous front month)
+  XAGUSD: "SI=F", // Silver futures
+  USOIL: "CL=F", // WTI Crude futures
+  NATGAS: "NG=F", // Natural Gas futures
+  NAS100: "^NDX",
+  SP500: "^GSPC",
+  US30: "^DJI",
+  UK100: "^FTSE",
+  GER40: "^GDAXI",
+  DXY: "DX-Y.NYB",
+  US10Y: "^TNX", // CBOE 10yr yield index, value is already in percent (e.g. 4.45 = 4.45%)
+  US30Y: "^TYX", // CBOE 30yr yield index, same convention
+};
 
 // CFTC's Traders in Financial Futures (TFF) dataset, Socrata Open Data API.
 // Free, public, no key, no login - government open data.
 // https://publicreporting.cftc.gov/Commitments-of-Traders/TFF-Futures-Only/gpe5-46if
 const CFTC_TFF_URL = "https://publicreporting.cftc.gov/resource/gpe5-46if.json";
 
-// Maps our terminal's symbols to CFTC's "Market_and_Exchange_Names" text.
-// CFTC uses full descriptive names, not tickers, so we match by substring.
+// Maps our terminal's symbols to CFTC's EXACT "Market_and_Exchange_Names" text
+// (verified against live API responses — not loose substrings). Loose
+// substrings like "EURO FX" or "DOW JONES" silently match the wrong contract
+// when CFTC lists multiple similarly-named markets (e.g. "EURO FX/BRITISH
+// POUND XRATE", "DOW JONES U.S. REAL ESTATE IDX"), so every entry here is
+// the full exact name of the standard, single contract we actually want.
+//
+// These live in the TFF (Traders in Financial Futures) dataset — currencies,
+// rates, and equity indices only. TFF does NOT cover physical commodities.
 const COT_SYMBOL_MAP = {
-  EURUSD: "EURO FX",
-  GBPUSD: "BRITISH POUND",
-  USDJPY: "JAPANESE YEN",
-  AUDUSD: "AUSTRALIAN DOLLAR",
-  USDCAD: "CANADIAN DOLLAR",
-  USDCHF: "SWISS FRANC",
-  NZDUSD: "NEW ZEALAND DOLLAR",
-  DXY: "USD INDEX",
-  NAS100: "NASDAQ-100",
-  SP500: "E-MINI S&P 500",
-  US30: "DOW JONES",
-  US10Y: "10-YEAR U.S. TREASURY NOTES",
-  US30Y: "ULTRA U.S. TREASURY BONDS",
-  XAUUSD: "GOLD",
-  XAGUSD: "SILVER",
+  EURUSD: "EURO FX - CHICAGO MERCANTILE EXCHANGE",
+  GBPUSD: "BRITISH POUND - CHICAGO MERCANTILE EXCHANGE",
+  USDJPY: "JAPANESE YEN - CHICAGO MERCANTILE EXCHANGE",
+  AUDUSD: "AUSTRALIAN DOLLAR - CHICAGO MERCANTILE EXCHANGE",
+  USDCAD: "CANADIAN DOLLAR - CHICAGO MERCANTILE EXCHANGE",
+  USDCHF: "SWISS FRANC - CHICAGO MERCANTILE EXCHANGE",
+  NZDUSD: "NEW ZEALAND DOLLAR - CHICAGO MERCANTILE EXCHANGE",
+  DXY: "USD INDEX - ICE FUTURES U.S.",
+  NAS100: "NASDAQ-100 Consolidated - CHICAGO MERCANTILE EXCHANGE",
+  SP500: "E-MINI S&P 500 - CHICAGO MERCANTILE EXCHANGE",
+  US30: "DOW JONES INDUSTRIAL AVERAGE - CHICAGO BOARD OF TRADE",
+  US10Y: "10-YEAR U.S. TREASURY NOTES - CHICAGO BOARD OF TRADE",
+  US30Y: "ULTRA U.S. TREASURY BONDS - CHICAGO BOARD OF TRADE",
+};
+
+// GOLD and SILVER are NOT in the TFF dataset at all — CFTC only reports
+// metals/physical commodities in the Disaggregated Futures-Only report,
+// which uses a different resource ID AND different trader categories
+// (Producer/Merchant, Swap Dealer, Managed Money, Other — not Dealer/
+// Asset Manager/Leveraged Funds). Fetched and summarized separately below.
+const CFTC_DISAGG_URL = "https://publicreporting.cftc.gov/resource/72hh-3qpy.json";
+const COT_DISAGG_SYMBOL_MAP = {
+  XAUUSD: "GOLD - COMMODITY EXCHANGE INC.",
+  XAGUSD: "SILVER - COMMODITY EXCHANGE INC.",
 };
 
 export default {
@@ -71,13 +107,16 @@ export default {
         return await proxyNews();
       }
       if (url.pathname === "/cot") {
-        return await proxyCot(env);
+        return await proxyCot();
+      }
+      if (url.pathname === "/prices") {
+        return await proxyPrices();
       }
       if (url.pathname === "/fxssi-raw") {
         return await fetchFxssiRaw();
       }
       return jsonResponse(
-        { error: { message: "Unknown endpoint. Use /calendar, /news, /cot, or /fxssi-raw." } },
+        { error: { message: "Unknown endpoint. Use /calendar, /news, /cot, /prices, or /fxssi-raw." } },
         404
       );
     } catch (err) {
@@ -87,127 +126,41 @@ export default {
 };
 
 // ── COT (Commitment of Traders) ──────────────────────────────────────────
-async function proxyCot(env) {
+async function proxyCot() {
   const now = Date.now();
-
-  // 1. Check KV first — this is durable and shared across ALL isolates,
-  //    unlike a module-level variable. If a fresh-enough copy exists here,
-  //    serve it immediately with zero CFTC calls.
-  const cached = await readCotCache(env);
-  if (cached && now - cached.fetchedAt < COT_CACHE_MS) {
-    return jsonResponse(cached.data, 200, { "X-Cache": "HIT" });
+  if (cotCache.data && now - cotCache.fetchedAt < COT_CACHE_MS) {
+    return jsonResponse(cotCache.data, 200, { "X-Cache": "HIT" });
   }
 
   // Pull the most recent report for every market in one call, sorted by
   // date descending, then keep only the newest row per market below.
-  const orderClause = encodeURIComponent("report_date_as_yyyy_mm_dd DESC");
-  const queryUrl = CFTC_TFF_URL + "?$limit=2000&$order=" + orderClause;
+  const queryUrl = CFTC_TFF_URL + "?$limit=500&$order=report_date_as_yyyy_mm_dd DESC";
+  const res = await fetch(queryUrl, {
+    headers: { "User-Agent": "Mozilla/5.0 (compatible; ICT-Terminal-Worker/1.0)" },
+  });
 
-  // BUG FIX: publicreporting.cftc.gov intermittently returns 502/503 to
-  // requests coming from Cloudflare Workers' shared IP ranges (this is a
-  // known pattern — government WAFs and bot-detection on .gov sites often
-  // reject traffic from cloud-provider IP blocks even though the request
-  // itself is fine). A single failed attempt was being treated as a hard
-  // failure with no retry, even though a second attempt moments later
-  // frequently succeeds. We now retry transient-looking failures (502,
-  // 503, 504, and network-level fetch throws) up to 3 times with a short
-  // backoff before giving up. We also use a realistic full browser User-
-  // Agent string instead of a generic "compatible; ICT-Terminal-Worker/1.0"
-  // identifier, since some .gov WAFs specifically allowlist real browser
-  // UAs and challenge or reject anything that self-identifies as a bot.
-  const REALISTIC_UA =
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
-  const TRANSIENT_STATUSES = [429, 502, 503, 504];
-  const MAX_ATTEMPTS = 3;
-
-  let res = null;
-  let lastError = null;
-  let lastStatus = null;
-
-  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-    try {
-      res = await fetch(queryUrl, {
-        headers: {
-          "User-Agent": REALISTIC_UA,
-          Accept: "application/json",
-        },
-      });
-      lastStatus = res.status;
-      if (res.ok) break; // success, stop retrying
-      if (TRANSIENT_STATUSES.indexOf(res.status) === -1) break; // non-transient, no point retrying
-    } catch (err) {
-      lastError = err;
-      res = null;
+  if (!res.ok) {
+    if (cotCache.data) {
+      return jsonResponse(cotCache.data, 200, { "X-Cache": "STALE-ON-ERROR" });
     }
-    if (attempt < MAX_ATTEMPTS) {
-      // Short backoff: 400ms, then 900ms. Workers have a CPU-time budget,
-      // so we keep this brief rather than a long exponential wait.
-      await sleep(attempt === 1 ? 400 : 900);
-    }
-  }
-
-  if (!res || !res.ok) {
-    // 2. CFTC failed this round — fall back to ANY cached copy we have in
-    //    KV, even if it's older than the normal 1hr freshness window.
-    //    Stale COT data (positioning from last Friday) is still far more
-    //    useful than an error, since COT only updates weekly anyway.
-    if (cached && cached.data) {
-      return jsonResponse(cached.data, 200, { "X-Cache": "STALE-ON-ERROR" });
-    }
-    // Surface the REAL upstream status (or network error) instead of
-    // always reporting a generic 502 — this is the difference between
-    // "CFTC rejected us with 403" and "CFTC's server actually errored",
-    // which previously looked identical from the terminal's point of view.
-    const detail = lastError
-      ? "network error contacting CFTC: " + lastError.message
-      : "CFTC source returned HTTP " + lastStatus + " after " + MAX_ATTEMPTS + " attempts";
-    return jsonResponse({ error: { message: detail } }, lastStatus && lastStatus < 500 ? lastStatus : 502);
+    return jsonResponse({ error: { message: "CFTC source returned " + res.status } }, 502);
   }
 
   let rows;
   try {
     rows = await res.json();
   } catch (e) {
-    if (cached && cached.data) {
-      return jsonResponse(cached.data, 200, { "X-Cache": "STALE-PARSE-ERROR" });
+    if (cotCache.data) {
+      return jsonResponse(cotCache.data, 200, { "X-Cache": "STALE-PARSE-ERROR" });
     }
     return jsonResponse({ error: { message: "CFTC source returned unparseable data: " + e.message } }, 502);
   }
 
   if (!Array.isArray(rows)) {
-    if (cached && cached.data) {
-      return jsonResponse(cached.data, 200, { "X-Cache": "STALE-SHAPE-ERROR" });
+    if (cotCache.data) {
+      return jsonResponse(cotCache.data, 200, { "X-Cache": "STALE-SHAPE-ERROR" });
     }
     return jsonResponse({ error: { message: "CFTC source returned unexpected shape." } }, 502);
-  }
-
-  // Sanity check: confirm rows are actually sorted newest-first now that
-  // $order is correctly encoded.
-  //
-  // FIX: the original 10-day threshold was too tight for reality. Live
-  // /cot-debug output on 2026-06-21 showed CFTC's own newest TFF report
-  // dated 2026-06-09 — 12 days old — which is NORMAL, not broken: CFTC's
-  // Tuesday-data/Friday-publish cadence can slip around holidays, and some
-  // less-active contracts simply update less often even when $order is
-  // correct. The old code was treating valid, real CFTC data as an error
-  // and discarding it, which was the actual cause of the 502s reported by
-  // the terminal (the field-name bug below caused 0s, but THIS date check
-  // was what made the whole request fail outright).
-  //
-  // We widen the threshold to 21 days (3 weeks) — generous enough to ride
-  // out a holiday-delayed report — and, more importantly, we no longer
-  // hard-fail the request over this. A stale-but-real date is still real
-  // COT data and far more useful to a trader than an error message. We
-  // just flag it for visibility instead.
-  const newestDate = rows.length > 0 ? rows[0].report_date_as_yyyy_mm_dd : null;
-  let staleWarning = null;
-  if (newestDate) {
-    const ageMs = now - new Date(newestDate).getTime();
-    const ageDays = ageMs / (24 * 60 * 60 * 1000);
-    if (ageDays > 21 || ageDays < -1) {
-      staleWarning =
-        "Newest CFTC report dated " + newestDate + " (" + Math.round(ageDays) + " days old) — older than usual.";
-    }
   }
 
   const result = {};
@@ -220,87 +173,35 @@ async function proxyCot(env) {
   }
 
   const payload = {
-    asOf: newestDate,
+    asOf: rows.length > 0 ? rows[0].report_date_as_yyyy_mm_dd : null,
     markets: result,
     source: "https://publicreporting.cftc.gov/Commitments-of-Traders/TFF-Futures-Only/gpe5-46if (CFTC public API)",
-    staleWarning: staleWarning,
   };
 
-  // 3. Persist to KV so every other isolate / future request benefits,
-  //    not just this one. Don't let a KV write failure break the response
-  //    we already have — log and continue.
-  await writeCotCache(env, { data: payload, fetchedAt: now });
-
+  cotCache = { data: payload, fetchedAt: now };
   return jsonResponse(payload, 200, { "X-Cache": "MISS" });
 }
 
-// KV read/write helpers — tolerate a missing binding (e.g. local dev
-// without KV configured) by behaving as if there's simply no cache yet,
-// rather than throwing and taking down the whole /cot endpoint.
-async function readCotCache(env) {
-  if (!env || !env.COT_KV) return null;
-  try {
-    const raw = await env.COT_KV.get(COT_CACHE_KEY);
-    if (!raw) return null;
-    return JSON.parse(raw);
-  } catch (e) {
-    return null;
-  }
-}
-
-async function writeCotCache(env, entry) {
-  if (!env || !env.COT_KV) return;
-  try {
-    // expirationTtl is a belt-and-suspenders cleanup; our own freshness
-    // check above (COT_CACHE_MS) is what actually governs HIT vs MISS.
-    await env.COT_KV.put(COT_CACHE_KEY, JSON.stringify(entry), {
-      expirationTtl: 7 * 24 * 60 * 60, // 7 days
-    });
-  } catch (e) {
-    // Swallow — a failed cache write shouldn't fail the request that
-    // already has good data to return to the caller.
-  }
-}
-
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-// Each market reports weekly, so with 500 rows ordered newest-first we may
-// not have reached every market's most recent row yet if many markets sort
-// ahead of it alphabetically/by-id for that date. Searching only the first
-// match by substring (without also requiring it be from the newest date)
-// risked matching an older row for less commonly-referenced markets. We
-// widened $limit to 2000 above; this raises the matched needle further to
-// also prefer rows dated on/near the newest date when multiple matches exist.
 function findFirstMatchingRow(rows, needle) {
-  const upperNeedle = needle.toUpperCase();
-  let firstMatch = null;
-  const newestDate = rows.length > 0 ? rows[0].report_date_as_yyyy_mm_dd : null;
   for (let i = 0; i < rows.length; i++) {
     const name = rows[i].market_and_exchange_names || "";
-    if (name.toUpperCase().indexOf(upperNeedle) !== -1) {
-      if (!firstMatch) firstMatch = rows[i];
-      // Prefer an exact newest-date match if we find one
-      if (newestDate && rows[i].report_date_as_yyyy_mm_dd === newestDate) {
-        return rows[i];
-      }
+    if (name.toUpperCase().indexOf(needle.toUpperCase()) !== -1) {
+      return rows[i];
     }
   }
-  return firstMatch;
+  return null;
 }
 
 function summarizeCotRow(row) {
   const num = (v) => (v === undefined || v === null || v === "" ? 0 : parseInt(v, 10));
 
-  // FIX: CFTC's actual JSON field names for these two categories do NOT
-  // have an "_all" suffix (confirmed via live /cot-debug response on
-  // 2026-06-21 — x-soda2-fields lists "asset_mgr_positions_long" and
-  // "lev_money_positions_long", not "..._long_all"). Only dealer_* and
-  // open_interest_all carry the _all suffix. Reading the wrong field name
-  // silently returned undefined -> 0 for every market's asset manager and
-  // leveraged funds positioning, which is the data ICT traders actually
-  // care about most (the "smart money" proxy).
+  // NOTE: CFTC's Socrata API is inconsistent about the "_all" suffix across
+  // trader categories. Verified against a live response (2026-05-05 report):
+  // dealer_positions_long_all / dealer_positions_short_all DO carry "_all",
+  // but asset_mgr_positions_long / asset_mgr_positions_short and
+  // lev_money_positions_long / lev_money_positions_short do NOT. Reading the
+  // wrong field name returns undefined -> num() silently defaults to 0 for
+  // every market, which is why this previously showed "FLAT 0" everywhere.
   const assetMgrLong = num(row.asset_mgr_positions_long);
   const assetMgrShort = num(row.asset_mgr_positions_short);
   const levMoneyLong = num(row.lev_money_positions_long);
@@ -318,7 +219,104 @@ function summarizeCotRow(row) {
   };
 }
 
-// ── CALENDAR ──────────────────────────────────────────────────────────────
+// ── LIVE PRICES (forex/indices/yields via Yahoo's v8 chart endpoint) ──────
+// NOTE ON SOURCE STABILITY: Yahoo's v7 quote endpoint started requiring a
+// crumb/cookie auth flow in 2026 and no longer works as a simple GET. The
+// v8 CHART endpoint does not have this requirement as of this writing and
+// is what this function uses - one request per symbol (chart endpoints
+// don't support batching), run in parallel. If Yahoo ever locks this down
+// too, this is the one function that needs a new source - nothing else
+// in the terminal needs to change, since it only ever talks to OUR /prices
+// endpoint, never to Yahoo directly.
+async function proxyPrices() {
+  const now = Date.now();
+  if (pricesCache.data && now - pricesCache.fetchedAt < PRICES_CACHE_MS) {
+    return jsonResponse(pricesCache.data, 200, { "X-Cache": "HIT" });
+  }
+
+  const ourSymbols = Object.keys(YAHOO_SYMBOL_MAP);
+  const results = await Promise.all(
+    ourSymbols.map(async (ourSymbol) => {
+      const yahooSymbol = YAHOO_SYMBOL_MAP[ourSymbol];
+      try {
+        const quote = await fetchYahooChartQuote(yahooSymbol);
+        return { ourSymbol, quote, error: null };
+      } catch (err) {
+        return { ourSymbol, quote: null, error: err.message };
+      }
+    })
+  );
+
+  const prices = {};
+  const errors = [];
+  for (const r of results) {
+    if (r.quote) {
+      prices[r.ourSymbol] = r.quote;
+    } else {
+      errors.push(r.ourSymbol + ": " + r.error);
+    }
+  }
+
+  const successCount = Object.keys(prices).length;
+  if (successCount === 0) {
+    // Total failure across every symbol - almost certainly Yahoo blocking the
+    // Worker's IP/UA rather than 19 unrelated tickers failing independently.
+    if (pricesCache.data) {
+      return jsonResponse(pricesCache.data, 200, { "X-Cache": "STALE-ON-ERROR" });
+    }
+    return jsonResponse(
+      { error: { message: "All price fetches failed - source may be unavailable: " + errors.join(" | ") } },
+      502
+    );
+  }
+
+  const payload = {
+    prices: prices,
+    errors: errors.length ? errors : undefined,
+    asOf: new Date(now).toISOString(),
+    source: "Yahoo Finance v8 chart endpoint (unofficial, no key)",
+  };
+
+  pricesCache = { data: payload, fetchedAt: now };
+  return jsonResponse(payload, 200, { "X-Cache": successCount < ourSymbols.length ? "PARTIAL-MISS" : "MISS" });
+}
+
+async function fetchYahooChartQuote(yahooSymbol) {
+  const chartUrl =
+    "https://query1.finance.yahoo.com/v8/finance/chart/" +
+    encodeURIComponent(yahooSymbol) +
+    "?range=1d&interval=1m";
+  const res = await fetch(chartUrl, {
+    headers: {
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+      Accept: "application/json",
+    },
+  });
+  if (!res.ok) {
+    throw new Error("HTTP " + res.status);
+  }
+  const data = await res.json();
+  const result = data && data.chart && data.chart.result && data.chart.result[0];
+  if (!result || !result.meta) {
+    throw new Error("unexpected response shape");
+  }
+  const meta = result.meta;
+  const price = meta.regularMarketPrice;
+  const prevClose = meta.chartPreviousClose != null ? meta.chartPreviousClose : meta.previousClose;
+  if (price == null) {
+    throw new Error("no regularMarketPrice in response");
+  }
+  const changePct = prevClose ? ((price - prevClose) / prevClose) * 100 : 0;
+  return {
+    price: price,
+    prevClose: prevClose != null ? prevClose : null,
+    changePct: changePct,
+    currency: meta.currency || null,
+    marketTime: meta.regularMarketTime ? meta.regularMarketTime * 1000 : null,
+  };
+}
+
+
 async function proxyCalendar() {
   const now = Date.now();
   if (calendarCache.data && now - calendarCache.fetchedAt < CALENDAR_CACHE_MS) {
