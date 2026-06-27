@@ -32,6 +32,9 @@ const CALENDAR_CACHE_MS = 5 * 60 * 1000;
 const COT_CACHE_KEY = "cot_latest";
 const COT_CACHE_MS = 60 * 60 * 1000; // COT updates once a week (Fri), 1hr cache is plenty
 
+const OPEX_CACHE_KEY = "opex_latest";
+const OPEX_CACHE_MS = 60 * 60 * 1000; // OPEX updates daily — 1hr cache, manual updates via PUT /opex/update
+
 // CFTC's Traders in Financial Futures (TFF) dataset, Socrata Open Data API.
 // Free, public, no key, no login - government open data.
 // https://publicreporting.cftc.gov/Commitments-of-Traders/TFF-Futures-Only/gpe5-46if
@@ -73,11 +76,23 @@ export default {
       if (url.pathname === "/cot") {
         return await proxyCot(env);
       }
+      if (url.pathname === "/stockfg") {
+        return await proxyStockFearGreed();
+      }
+      if (url.pathname === "/opex") {
+        return await proxyOpex(env);
+      }
+      // PUT /opex/update — manually push today's OPEX data from your phone/browser
+      // Body: the full OPEX JSON object (see terminal source for shape)
+      // Example: curl -X PUT https://your-worker.workers.dev/opex/update -H "Content-Type: application/json" -d '{"asOf":"2026-06-27","source":"investing.com","expiries":[...]}'
+      if (url.pathname === "/opex/update" && request.method === "PUT") {
+        return await updateOpex(request, env);
+      }
       if (url.pathname === "/fxssi-raw") {
         return await fetchFxssiRaw();
       }
       return jsonResponse(
-        { error: { message: "Unknown endpoint. Use /calendar, /news, /cot, or /fxssi-raw." } },
+        { error: { message: "Unknown endpoint. Use /calendar, /news, /cot, /stockfg, /opex, or PUT /opex/update." } },
         404
       );
     } catch (err) {
@@ -260,6 +275,110 @@ async function writeCotCache(env, entry) {
     // Swallow — a failed cache write shouldn't fail the request that
     // already has good data to return to the caller.
   }
+}
+
+// ── STOCK FEAR & GREED (CNN Business) ────────────────────────────────────
+// CNN's internal API endpoint — returns the current Fear & Greed score and
+// rating for the US stock market. Used by the terminal's sentiment card for
+// FX/indices bias (separate from the crypto F&G from alternative.me).
+// This is undocumented but stable — CNN uses it for their own widget.
+async function proxyStockFearGreed() {
+  const CNN_FG_URL = "https://production.dataviz.cnn.io/index/fearandgreed/graphdata";
+  try {
+    const res = await fetch(CNN_FG_URL, {
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+        "Referer": "https://www.cnn.com/markets/fear-and-greed",
+        "Accept": "application/json, */*",
+      },
+    });
+    if (!res.ok) {
+      return jsonResponse({ error: { message: "CNN F&G returned HTTP " + res.status } }, 502);
+    }
+    const data = await res.json();
+    // CNN response shape: { fear_and_greed: { score: 26.1, rating: "fear", ... }, ... }
+    const fg = data && data.fear_and_greed;
+    if (!fg || fg.score == null) {
+      return jsonResponse({ error: { message: "Unexpected CNN F&G response shape" } }, 502);
+    }
+    return jsonResponse({
+      value: Math.round(fg.score),
+      rating: fg.rating || "unknown",
+      previous_close: fg.previous_close || null,
+      previous_1_week: fg.previous_1_week || null,
+      timestamp: fg.timestamp || null,
+      source: "CNN Business Fear & Greed Index",
+    }, 200);
+  } catch (err) {
+    return jsonResponse({ error: { message: "CNN F&G fetch failed: " + err.message } }, 502);
+  }
+}
+
+// ── FX OPTIONS EXPIRY (OPEX) ─────────────────────────────────────────────
+// OPEX data is updated manually each day by calling PUT /opex/update with
+// the day's strike levels (from investing.com/forex-options or @pizzo_fx).
+// The data is stored in Workers KV so all terminal instances see it instantly.
+// GET /opex returns today's data or the last known data with a staleness flag.
+async function proxyOpex(env) {
+  try {
+    const stored = await readOpexCache(env);
+    if (!stored) {
+      // No data ever pushed — return a helpful empty state, not an error
+      return jsonResponse({
+        asOf: null,
+        source: null,
+        stale: true,
+        message: "No OPEX data yet. Use PUT /opex/update to push today's strike levels.",
+        expiries: [],
+      }, 200);
+    }
+    const ageMs = Date.now() - (stored.fetchedAt || 0);
+    const stale = ageMs > OPEX_CACHE_MS;
+    return jsonResponse({ ...stored.data, stale, ageMs }, 200, {
+      "X-Cache": stale ? "STALE" : "HIT",
+    });
+  } catch (err) {
+    return jsonResponse({ error: { message: "OPEX read failed: " + err.message } }, 500);
+  }
+}
+
+// PUT /opex/update — push new OPEX data into KV.
+// Called manually from curl/browser once per day with the day's strike levels.
+// No auth key required (worker is on your own domain — if you want auth, add
+// a secret header check here using env.OPEX_SECRET).
+async function updateOpex(request, env) {
+  try {
+    const body = await request.json();
+    if (!body || !Array.isArray(body.expiries)) {
+      return jsonResponse({ error: { message: "Body must be JSON with an 'expiries' array." } }, 400);
+    }
+    // Stamp with server time if asOf not provided
+    if (!body.asOf) {
+      body.asOf = new Date().toISOString().slice(0, 10);
+    }
+    await writeOpexCache(env, body);
+    return jsonResponse({
+      ok: true,
+      asOf: body.asOf,
+      pairs: body.expiries.map(function(e) { return e.pair; }),
+      message: "OPEX data stored. Terminal will show updated levels on next /opex fetch.",
+    }, 200);
+  } catch (err) {
+    return jsonResponse({ error: { message: "OPEX update failed: " + err.message } }, 500);
+  }
+}
+
+async function readOpexCache(env) {
+  try {
+    if (!env || !env.COT_KV) return null; // reuse same KV binding
+    const raw = await env.COT_KV.get(OPEX_CACHE_KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch (e) { return null; }
+}
+
+async function writeOpexCache(env, data) {
+  if (!env || !env.COT_KV) return;
+  await env.COT_KV.put(OPEX_CACHE_KEY, JSON.stringify({ data, fetchedAt: Date.now() }));
 }
 
 function sleep(ms) {
