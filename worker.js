@@ -49,18 +49,27 @@ const COT_SYMBOL_MAP = {
   AUDUSD: "AUSTRALIAN DOLLAR",
   USDCAD: "CANADIAN DOLLAR",
   USDCHF: "SWISS FRANC",
-  NZDUSD: "NEW ZEALAND DOLLAR",
+  // NOTE: CFTC abbreviates here — "NZ DOLLAR", not "NEW ZEALAND DOLLAR".
+  // The latter only appears in the commodity_name field, not the market
+  // name. Confirmed via /tff-debug?contains=NZ%20DOLLAR on 2026-06-29.
+  NZDUSD: "NZ DOLLAR",
   DXY: "USD INDEX",
   NAS100: "NASDAQ-100",
   SP500: "E-MINI S&P 500",
-  // BUG FIX: "DOW JONES" alone also matches "DOW JONES U.S. REAL ESTATE IDX"
-  // (CFTC code #124606), which sorts ahead of the actual DJIA futures
-  // (#124603) in many result sets — confirmed against CFTC's own published
-  // financial futures reports, where both contracts literally start with
-  // "DOW JONES". The needle must be specific enough to exclude Real Estate.
-  US30: "DOW JONES INDUSTRIAL AVG",
-  US10Y: "10-YEAR U.S. TREASURY NOTES",
-  US30Y: "ULTRA U.S. TREASURY BONDS",
+  // NOTE: US30 (DJIA futures) intentionally omitted — confirmed via
+  // /tff-debug?contains=DOW on 2026-06-29 that it currently does NOT
+  // appear in the live TFF dataset at all (only "DOW JONES U.S. REAL
+  // ESTATE IDX" does). This isn't a naming bug like the others; CFTC only
+  // publishes TFF data for markets with 20+ reportable traders, and the
+  // standalone DJIA futures contract apparently doesn't clear that bar
+  // right now. Showing nothing is correct here, not a gap to "fix."
+  //
+  // NOTE: CFTC abbreviates Treasuries to "UST", not "U.S. TREASURY".
+  // "UST 10Y NOTE" is the standard 10-year note; "ULTRA UST BOND" is the
+  // long bond (don't confuse with "ULTRA UST 10Y", a different contract).
+  // Confirmed via /tff-debug?contains=UST on 2026-06-29.
+  US10Y: "UST 10Y NOTE",
+  US30Y: "ULTRA UST BOND",
   // NOTE: XAUUSD/XAGUSD removed from here — gold and silver are physical
   // commodities, not financial futures, so they structurally cannot appear
   // in the TFF (Traders in Financial Futures) dataset this map queries.
