@@ -53,11 +53,32 @@ const COT_SYMBOL_MAP = {
   DXY: "USD INDEX",
   NAS100: "NASDAQ-100",
   SP500: "E-MINI S&P 500",
-  US30: "DOW JONES",
+  // BUG FIX: "DOW JONES" alone also matches "DOW JONES U.S. REAL ESTATE IDX"
+  // (CFTC code #124606), which sorts ahead of the actual DJIA futures
+  // (#124603) in many result sets — confirmed against CFTC's own published
+  // financial futures reports, where both contracts literally start with
+  // "DOW JONES". The needle must be specific enough to exclude Real Estate.
+  US30: "DOW JONES INDUSTRIAL AVG",
   US10Y: "10-YEAR U.S. TREASURY NOTES",
   US30Y: "ULTRA U.S. TREASURY BONDS",
-  XAUUSD: "GOLD",
-  XAGUSD: "SILVER",
+  // NOTE: XAUUSD/XAGUSD removed from here — gold and silver are physical
+  // commodities, not financial futures, so they structurally cannot appear
+  // in the TFF (Traders in Financial Futures) dataset this map queries.
+  // They silently matched nothing before. See DISAGG_SYMBOL_MAP below,
+  // which queries the correct CFTC dataset (Disaggregated Futures-Only)
+  // for these two.
+};
+
+// CFTC's Disaggregated Futures-Only dataset, Socrata Open Data API.
+// This is the correct dataset for physical commodities (metals, energy,
+// ag) — TFF above only covers financial futures (currencies, rates,
+// equity indices) and structurally never includes Gold/Silver.
+// https://publicreporting.cftc.gov/Commitments-of-Traders/Disaggregated-Futures-Only/72hh-3qpy
+const CFTC_DISAGG_URL = "https://publicreporting.cftc.gov/resource/72hh-3qpy.json";
+
+const DISAGG_SYMBOL_MAP = {
+  XAUUSD: "GOLD - COMMODITY EXCHANGE INC",
+  XAGUSD: "SILVER - COMMODITY EXCHANGE INC",
 };
 
 export default {
@@ -76,6 +97,9 @@ export default {
       if (url.pathname === "/cot") {
         return await proxyCot(env);
       }
+      if (url.pathname === "/disagg-debug") {
+        return await debugDisagg();
+      }
       if (url.pathname === "/stockfg") {
         return await proxyStockFearGreed();
       }
@@ -92,7 +116,7 @@ export default {
         return await fetchFxssiRaw();
       }
       return jsonResponse(
-        { error: { message: "Unknown endpoint. Use /calendar, /news, /cot, /stockfg, /opex, or PUT /opex/update." } },
+        { error: { message: "Unknown endpoint. Use /calendar, /news, /cot, /stockfg, /opex, /disagg-debug, or PUT /opex/update." } },
         404
       );
     } catch (err) {
@@ -249,9 +273,60 @@ async function proxyCot(env) {
   return jsonResponse(payload, 200, { "X-Cache": "MISS" });
 }
 
-// KV read/write helpers — tolerate a missing binding (e.g. local dev
-// without KV configured) by behaving as if there's simply no cache yet,
-// rather than throwing and taking down the whole /cot endpoint.
+// ── DISAGGREGATED REPORT DEBUG (Gold/Silver field-name verification) ──────
+// Same lesson as the TFF dealer_positions_long_all bug: don't trust CFTC's
+// documented field names, check what the live API actually returns. This
+// queries the Disaggregated Futures-Only dataset, finds the newest Gold and
+// Silver rows, and returns their RAW keys/values untouched so we can see
+// the real field names before wiring them into /cot permanently.
+async function debugDisagg() {
+  const orderClause = encodeURIComponent("report_date_as_yyyy_mm_dd DESC");
+  const queryUrl = CFTC_DISAGG_URL + "?$limit=3000&$order=" + orderClause;
+  const REALISTIC_UA =
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
+
+  let res;
+  try {
+    res = await fetch(queryUrl, { headers: { "User-Agent": REALISTIC_UA, Accept: "application/json" } });
+  } catch (e) {
+    return jsonResponse({ error: { message: "network error contacting CFTC: " + e.message } }, 502);
+  }
+  if (!res.ok) {
+    return jsonResponse({ error: { message: "CFTC source returned HTTP " + res.status } }, 502);
+  }
+
+  const rows = await res.json();
+  if (!Array.isArray(rows)) {
+    return jsonResponse({ error: { message: "CFTC source returned unexpected shape." } }, 502);
+  }
+
+  // Surface every distinct market_and_exchange_names value containing GOLD
+  // or SILVER, so we can see the exact contract name strings too (there
+  // may be more than one Gold/Silver contract — micro, mini, etc.)
+  const matchingNames = new Set();
+  let goldRow = null;
+  let silverRow = null;
+  for (const row of rows) {
+    const name = (row.market_and_exchange_names || "").toUpperCase();
+    if (name.indexOf("GOLD") !== -1) {
+      matchingNames.add(row.market_and_exchange_names);
+      if (!goldRow) goldRow = row;
+    }
+    if (name.indexOf("SILVER") !== -1) {
+      matchingNames.add(row.market_and_exchange_names);
+      if (!silverRow) silverRow = row;
+    }
+  }
+
+  return jsonResponse({
+    distinctGoldSilverContractNames: Array.from(matchingNames),
+    rawGoldRow: goldRow,
+    rawSilverRow: silverRow,
+    totalRowsFetched: rows.length,
+    newestDateInResultSet: rows.length ? rows[0].report_date_as_yyyy_mm_dd : null,
+  });
+}
+
 async function readCotCache(env) {
   if (!env || !env.COT_KV) return null;
   try {
