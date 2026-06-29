@@ -76,9 +76,15 @@ const COT_SYMBOL_MAP = {
 // https://publicreporting.cftc.gov/Commitments-of-Traders/Disaggregated-Futures-Only/72hh-3qpy
 const CFTC_DISAGG_URL = "https://publicreporting.cftc.gov/resource/72hh-3qpy.json";
 
-const DISAGG_SYMBOL_MAP = {
-  XAUUSD: "GOLD - COMMODITY EXCHANGE INC",
-  XAGUSD: "SILVER - COMMODITY EXCHANGE INC",
+// EXACT contract names (verified live via /disagg-debug on 2026-06-28) — NOT
+// substring needles. CFTC also lists "MICRO GOLD - COMMODITY EXCHANGE INC."
+// and "MICRO SILVER - COMMODITY EXCHANGE INC.", and a substring match for
+// "GOLD - COMMODITY EXCHANGE INC" would ALSO match inside "MICRO GOLD - ...".
+// in the exact same way "DOW JONES" matched the wrong contract above. We use
+// exact equality here instead of indexOf to rule that out structurally.
+const DISAGG_EXACT_NAMES = {
+  XAUUSD: "GOLD - COMMODITY EXCHANGE INC.",
+  XAGUSD: "SILVER - COMMODITY EXCHANGE INC.",
 };
 
 export default {
@@ -126,6 +132,63 @@ export default {
 };
 
 // ── COT (Commitment of Traders) ──────────────────────────────────────────
+
+// BUG FIX (kept from before): publicreporting.cftc.gov intermittently
+// returns 502/503 to requests coming from Cloudflare Workers' shared IP
+// ranges (a known pattern — government WAFs and bot-detection on .gov sites
+// often reject traffic from cloud-provider IP blocks even though the
+// request itself is fine). We retry transient-looking failures (429, 502,
+// 503, 504, and network-level fetch throws) up to 3 times with a short
+// backoff, and use a realistic full browser User-Agent instead of a
+// self-identifying bot UA, since some .gov WAFs specifically allowlist real
+// browser UAs. Shared between the TFF and Disaggregated fetches below —
+// both hit the exact same CFTC infrastructure and the exact same problem.
+const REALISTIC_UA =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
+const TRANSIENT_STATUSES = [429, 502, 503, 504];
+const MAX_ATTEMPTS = 3;
+
+async function fetchCftcRowsWithRetry(queryUrl) {
+  let res = null;
+  let lastError = null;
+  let lastStatus = null;
+
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    try {
+      res = await fetch(queryUrl, {
+        headers: { "User-Agent": REALISTIC_UA, Accept: "application/json" },
+      });
+      lastStatus = res.status;
+      if (res.ok) break;
+      if (TRANSIENT_STATUSES.indexOf(res.status) === -1) break;
+    } catch (err) {
+      lastError = err;
+      res = null;
+    }
+    if (attempt < MAX_ATTEMPTS) {
+      await sleep(attempt === 1 ? 400 : 900);
+    }
+  }
+
+  if (!res || !res.ok) {
+    const detail = lastError
+      ? "network error contacting CFTC: " + lastError.message
+      : "CFTC source returned HTTP " + lastStatus + " after " + MAX_ATTEMPTS + " attempts";
+    return { rows: null, error: detail, status: lastStatus };
+  }
+
+  let rows;
+  try {
+    rows = await res.json();
+  } catch (e) {
+    return { rows: null, error: "CFTC source returned unparseable data: " + e.message, status: lastStatus };
+  }
+  if (!Array.isArray(rows)) {
+    return { rows: null, error: "CFTC source returned unexpected shape.", status: lastStatus };
+  }
+  return { rows, error: null, status: lastStatus };
+}
+
 async function proxyCot(env) {
   const now = Date.now();
 
@@ -140,52 +203,11 @@ async function proxyCot(env) {
   // Pull the most recent report for every market in one call, sorted by
   // date descending, then keep only the newest row per market below.
   const orderClause = encodeURIComponent("report_date_as_yyyy_mm_dd DESC");
-  const queryUrl = CFTC_TFF_URL + "?$limit=2000&$order=" + orderClause;
+  const tffUrl = CFTC_TFF_URL + "?$limit=2000&$order=" + orderClause;
 
-  // BUG FIX: publicreporting.cftc.gov intermittently returns 502/503 to
-  // requests coming from Cloudflare Workers' shared IP ranges (this is a
-  // known pattern — government WAFs and bot-detection on .gov sites often
-  // reject traffic from cloud-provider IP blocks even though the request
-  // itself is fine). A single failed attempt was being treated as a hard
-  // failure with no retry, even though a second attempt moments later
-  // frequently succeeds. We now retry transient-looking failures (502,
-  // 503, 504, and network-level fetch throws) up to 3 times with a short
-  // backoff before giving up. We also use a realistic full browser User-
-  // Agent string instead of a generic "compatible; ICT-Terminal-Worker/1.0"
-  // identifier, since some .gov WAFs specifically allowlist real browser
-  // UAs and challenge or reject anything that self-identifies as a bot.
-  const REALISTIC_UA =
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
-  const TRANSIENT_STATUSES = [429, 502, 503, 504];
-  const MAX_ATTEMPTS = 3;
+  const tffResult = await fetchCftcRowsWithRetry(tffUrl);
 
-  let res = null;
-  let lastError = null;
-  let lastStatus = null;
-
-  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-    try {
-      res = await fetch(queryUrl, {
-        headers: {
-          "User-Agent": REALISTIC_UA,
-          Accept: "application/json",
-        },
-      });
-      lastStatus = res.status;
-      if (res.ok) break; // success, stop retrying
-      if (TRANSIENT_STATUSES.indexOf(res.status) === -1) break; // non-transient, no point retrying
-    } catch (err) {
-      lastError = err;
-      res = null;
-    }
-    if (attempt < MAX_ATTEMPTS) {
-      // Short backoff: 400ms, then 900ms. Workers have a CPU-time budget,
-      // so we keep this brief rather than a long exponential wait.
-      await sleep(attempt === 1 ? 400 : 900);
-    }
-  }
-
-  if (!res || !res.ok) {
+  if (!tffResult.rows) {
     // 2. CFTC failed this round — fall back to ANY cached copy we have in
     //    KV, even if it's older than the normal 1hr freshness window.
     //    Stale COT data (positioning from last Friday) is still far more
@@ -193,32 +215,13 @@ async function proxyCot(env) {
     if (cached && cached.data) {
       return jsonResponse(cached.data, 200, { "X-Cache": "STALE-ON-ERROR" });
     }
-    // Surface the REAL upstream status (or network error) instead of
-    // always reporting a generic 502 — this is the difference between
-    // "CFTC rejected us with 403" and "CFTC's server actually errored",
-    // which previously looked identical from the terminal's point of view.
-    const detail = lastError
-      ? "network error contacting CFTC: " + lastError.message
-      : "CFTC source returned HTTP " + lastStatus + " after " + MAX_ATTEMPTS + " attempts";
-    return jsonResponse({ error: { message: detail } }, lastStatus && lastStatus < 500 ? lastStatus : 502);
+    return jsonResponse(
+      { error: { message: tffResult.error } },
+      tffResult.status && tffResult.status < 500 ? tffResult.status : 502
+    );
   }
 
-  let rows;
-  try {
-    rows = await res.json();
-  } catch (e) {
-    if (cached && cached.data) {
-      return jsonResponse(cached.data, 200, { "X-Cache": "STALE-PARSE-ERROR" });
-    }
-    return jsonResponse({ error: { message: "CFTC source returned unparseable data: " + e.message } }, 502);
-  }
-
-  if (!Array.isArray(rows)) {
-    if (cached && cached.data) {
-      return jsonResponse(cached.data, 200, { "X-Cache": "STALE-SHAPE-ERROR" });
-    }
-    return jsonResponse({ error: { message: "CFTC source returned unexpected shape." } }, 502);
-  }
+  const rows = tffResult.rows;
 
   // Sanity check: confirm rows are actually sorted newest-first now that
   // $order is correctly encoded.
@@ -258,11 +261,37 @@ async function proxyCot(env) {
     }
   }
 
+  // ── Gold/Silver — separate CFTC dataset (Disaggregated Futures-Only).
+  // Best-effort: if this fails, we still return everything else above
+  // rather than failing the whole /cot endpoint over a secondary dataset.
+  let disaggError = null;
+  try {
+    const disaggUrl = CFTC_DISAGG_URL + "?$limit=3000&$order=" + orderClause;
+    const disaggResult = await fetchCftcRowsWithRetry(disaggUrl);
+    if (disaggResult.rows) {
+      for (const ourSymbol in DISAGG_EXACT_NAMES) {
+        const exactName = DISAGG_EXACT_NAMES[ourSymbol];
+        // Exact match, not substring — see comment on DISAGG_EXACT_NAMES.
+        const match = disaggResult.rows.find((r) => r.market_and_exchange_names === exactName);
+        if (match) {
+          result[ourSymbol] = summarizeDisaggRow(match);
+        }
+      }
+    } else {
+      disaggError = disaggResult.error;
+    }
+  } catch (e) {
+    disaggError = "unexpected error fetching Disaggregated dataset: " + e.message;
+  }
+
   const payload = {
     asOf: newestDate,
     markets: result,
-    source: "https://publicreporting.cftc.gov/Commitments-of-Traders/TFF-Futures-Only/gpe5-46if (CFTC public API)",
+    source:
+      "https://publicreporting.cftc.gov/Commitments-of-Traders/TFF-Futures-Only/gpe5-46if and " +
+      "Disaggregated-Futures-Only/72hh-3qpy (CFTC public API)",
     staleWarning: staleWarning,
+    disaggError: disaggError, // null when Gold/Silver fetched fine; otherwise explains why they're missing
   };
 
   // 3. Persist to KV so every other isolate / future request benefits,
@@ -271,6 +300,43 @@ async function proxyCot(env) {
   await writeCotCache(env, { data: payload, fetchedAt: now });
 
   return jsonResponse(payload, 200, { "X-Cache": "MISS" });
+}
+
+function summarizeDisaggRow(row) {
+  const num = (v) => (v === undefined || v === null || v === "" ? 0 : parseInt(v, 10));
+
+  // Field names confirmed live via /disagg-debug on 2026-06-28. Note the
+  // genuine double underscore in "swap__positions_short_all" and
+  // "swap__positions_spread_all" — that's CFTC's actual field name, not a
+  // typo introduced here. prod_merc and other_rept have NO "_all" suffix;
+  // swap and m_money DO. Same lesson as the TFF dealer_positions_long_all
+  // bug: the suffix pattern is inconsistent across CFTC's own datasets, so
+  // we read exactly what the live API returns rather than what the
+  // category names would suggest.
+  //
+  // "Producer/Merchant/Processor/User" is the closest real analog to
+  // "Commercial" for a physical commodity like Gold/Silver — these are the
+  // miners, refiners, and bullion dealers hedging actual physical exposure,
+  // which is conceptually different from TFF's "Dealer/Intermediary" used
+  // for FX (bank market-makers, not physical hedgers).
+  const commercialLong = num(row.prod_merc_positions_long);
+  const commercialShort = num(row.prod_merc_positions_short);
+  const swapLong = num(row.swap_positions_long_all);
+  const swapShort = num(row.swap__positions_short_all);
+  const moneyMgrLong = num(row.m_money_positions_long_all);
+  const moneyMgrShort = num(row.m_money_positions_short_all);
+  const otherLong = num(row.other_rept_positions_long);
+  const otherShort = num(row.other_rept_positions_short);
+
+  return {
+    marketName: row.market_and_exchange_names,
+    reportDate: row.report_date_as_yyyy_mm_dd,
+    openInterest: num(row.open_interest_all),
+    commercial: { long: commercialLong, short: commercialShort, net: commercialLong - commercialShort },
+    swapDealers: { long: swapLong, short: swapShort, net: swapLong - swapShort },
+    managedMoney: { long: moneyMgrLong, short: moneyMgrShort, net: moneyMgrLong - moneyMgrShort },
+    otherReportables: { long: otherLong, short: otherShort, net: otherLong - otherShort },
+  };
 }
 
 // ── DISAGGREGATED REPORT DEBUG (Gold/Silver field-name verification) ──────
