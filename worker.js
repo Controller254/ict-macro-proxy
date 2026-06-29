@@ -106,6 +106,9 @@ export default {
       if (url.pathname === "/disagg-debug") {
         return await debugDisagg();
       }
+      if (url.pathname === "/tff-debug") {
+        return await debugTff(url.searchParams.get("contains") || "DOW");
+      }
       if (url.pathname === "/stockfg") {
         return await proxyStockFearGreed();
       }
@@ -122,7 +125,7 @@ export default {
         return await fetchFxssiRaw();
       }
       return jsonResponse(
-        { error: { message: "Unknown endpoint. Use /calendar, /news, /cot, /stockfg, /opex, /disagg-debug, or PUT /opex/update." } },
+        { error: { message: "Unknown endpoint. Use /calendar, /news, /cot, /stockfg, /opex, /disagg-debug, /tff-debug, or PUT /opex/update." } },
         404
       );
     } catch (err) {
@@ -337,6 +340,42 @@ function summarizeDisaggRow(row) {
     managedMoney: { long: moneyMgrLong, short: moneyMgrShort, net: moneyMgrLong - moneyMgrShort },
     otherReportables: { long: otherLong, short: otherShort, net: otherLong - otherShort },
   };
+}
+
+// ── TFF REPORT DEBUG (generic — find any contract by partial name) ────────
+// US30, US10Y, US30Y, and NZDUSD all came back empty from /cot even though
+// they're in COT_SYMBOL_MAP. Rather than guess at why (wrong name string?
+// reported under Combined instead of Futures-Only? genuinely absent this
+// week?), this surfaces every distinct market name in the live dataset
+// containing a given substring — same debugging approach that found the
+// real Gold/Silver field names. Usage: /tff-debug?contains=DOW
+async function debugTff(containsText) {
+  const orderClause = encodeURIComponent("report_date_as_yyyy_mm_dd DESC");
+  const queryUrl = CFTC_TFF_URL + "?$limit=3000&$order=" + orderClause;
+  const result = await fetchCftcRowsWithRetry(queryUrl);
+
+  if (!result.rows) {
+    return jsonResponse({ error: { message: result.error } }, result.status && result.status < 500 ? result.status : 502);
+  }
+
+  const upper = containsText.toUpperCase();
+  const matchingNames = new Set();
+  let sampleRow = null;
+  for (const row of result.rows) {
+    const name = (row.market_and_exchange_names || "").toUpperCase();
+    if (name.indexOf(upper) !== -1) {
+      matchingNames.add(row.market_and_exchange_names);
+      if (!sampleRow) sampleRow = row;
+    }
+  }
+
+  return jsonResponse({
+    searchedFor: containsText,
+    distinctMatchingNames: Array.from(matchingNames),
+    sampleRow: sampleRow,
+    totalRowsFetched: result.rows.length,
+    newestDateInResultSet: result.rows.length ? result.rows[0].report_date_as_yyyy_mm_dd : null,
+  });
 }
 
 // ── DISAGGREGATED REPORT DEBUG (Gold/Silver field-name verification) ──────
